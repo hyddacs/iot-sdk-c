@@ -1,21 +1,30 @@
 #include "gw_sdk.h"
 #include <ctype.h>
+#include <errno.h>
+#include <time.h>
 
 static Gateway g_gw;
 static RouteTable g_route;
 static char g_cfg_path[256];
 static user_service_cb_t g_user_service_cb = NULL;
 ota_callback_t g_user_ota_callback = NULL;
-
-typedef struct {
-    ota_data_cb data_cb;
-    int user_error;
-} OtaDownloadCtx;
+static ota_data_cb g_user_ota_data_cb = NULL;
+static ota_file_start_cb g_user_ota_file_start_cb = NULL;
+static ota_file_finish_cb g_user_ota_file_finish_cb = NULL;
+static pthread_mutex_t g_ota_task_lock = PTHREAD_MUTEX_INITIALIZER;
+static int g_ota_task_running = 0;
 
 #define TIMESTAMP_VALUE             "2524608000000"
 #define MQTT_CLINETID_KV            "|timestamp=2524608000000,_v=paho-c-1.0.0,securemode=3,signmethod=hmacsha256,lan=C|"
 #define SHA256_KEY_IOPAD_SIZE       64
 #define SHA256_DIGEST_SIZE          32
+#define OTA_PROGRESS_MIN_INTERVAL_MS 3000
+
+enum {
+    OTA_HASH_NONE = 0,
+    OTA_HASH_MD5,
+    OTA_HASH_SHA256
+};
 
 typedef struct {
     uint32_t total[2];
@@ -23,6 +32,33 @@ typedef struct {
     unsigned char buffer[64];
     int is224;
 } iot_sha256_context;
+
+typedef struct iot_md5_context {
+    uint32_t total[2];
+    uint32_t state[4];
+    unsigned char buffer[64];
+} iot_md5_context;
+
+typedef struct {
+    ota_data_cb data_cb;
+    const char *module;
+    curl_off_t total_bytes;
+    curl_off_t downloaded_bytes;
+    curl_off_t file_start_bytes;
+    curl_off_t file_expected_size;
+    int last_report_percent;
+    long long last_report_ms;
+    int report_progress;
+    int user_error;
+    int hash_type;
+    char expected_hash[65];
+    iot_sha256_context sha256_ctx;
+    iot_md5_context md5_ctx;
+} OtaDownloadCtx;
+
+typedef struct {
+    char *payload;
+} OtaTask;
 
 static void utils_sha256_zeroize(void *v, uint32_t n);
 void utils_sha256_init(iot_sha256_context *ctx);
@@ -33,6 +69,24 @@ void utils_sha256_update(iot_sha256_context *ctx, const unsigned char *input, ui
 void utils_sha256_finish(iot_sha256_context *ctx, uint8_t output[32]);
 void utils_sha256(const uint8_t *input, uint32_t ilen, uint8_t output[32]);
 static void utils_hmac_sha256(const uint8_t *msg, uint32_t msg_len, const uint8_t *key, uint32_t key_len, uint8_t output[32]);
+static int ota_start_task(const char *payload);
+static void *ota_task_thread(void *arg);
+static int ota_download_file_internal(const char *url, OtaDownloadCtx *ctx);
+static int ota_report_progress_from_ctx(OtaDownloadCtx *ctx, const char *desc, int force);
+static const char *ota_json_get_string(cJSON *obj, const char *key1, const char *key2);
+static int ota_json_get_int(cJSON *obj, const char *key1, const char *key2);
+static curl_off_t ota_json_get_size(cJSON *obj, const char *key1, const char *key2);
+static long long ota_now_ms(void);
+static void gw_make_msg_id(char *buf, size_t len);
+static int ota_code_is_success(cJSON *root);
+static int ota_prepare_file_check(OtaDownloadCtx *ctx, const char *sign_method,
+                                  const char *file_sign, const char *file_md5,
+                                  curl_off_t file_size);
+static int ota_finish_file_check(OtaDownloadCtx *ctx);
+static void utils_md5_init(iot_md5_context *ctx);
+static void utils_md5_starts(iot_md5_context *ctx);
+static void utils_md5_update(iot_md5_context *ctx, const unsigned char *input, uint32_t ilen);
+static void utils_md5_finish(iot_md5_context *ctx, uint8_t output[16]);
 
 static void _hex2str(uint8_t *input, uint16_t input_len, char *output)
 {
@@ -134,7 +188,7 @@ static const uint32_t K[] = {
 };
 
 void utils_sha256_process(iot_sha256_context *ctx, const unsigned char data[64]) {
-    uint32_t temp1, temp2, W[64], A[8];
+    uint32_t temp1, W[64], A[8];
     for (int i = 0; i < 8; i++) A[i] = ctx->state[i];
     for (int i = 0; i < 64; i++) {
         if (i < 16) GET_UINT32_BE(W[i], data, 4 * i); else R(i);
@@ -147,6 +201,9 @@ void utils_sha256_process(iot_sha256_context *ctx, const unsigned char data[64])
 void utils_sha256_update(iot_sha256_context *ctx, const unsigned char *input, uint32_t ilen) {
     uint32_t left = ctx->total[0] & 0x3F, fill = 64 - left;
     ctx->total[0] += ilen;
+    if (ctx->total[0] < ilen) {
+        ctx->total[1]++;
+    }
     if (left && ilen >= fill) {
         memcpy(ctx->buffer + left, input, fill);
         utils_sha256_process(ctx, ctx->buffer);
@@ -182,6 +239,171 @@ void utils_sha256(const uint8_t *input, uint32_t ilen, uint8_t output[32]) {
     utils_sha256_update(&ctx, input, ilen);
     utils_sha256_finish(&ctx, output);
     utils_sha256_free(&ctx);
+}
+
+#define MD5_GET_UINT32_LE(n,b,i) \
+    do { (n) = ((uint32_t)(b)[i]) | ((uint32_t)(b)[(i) + 1] << 8) | \
+               ((uint32_t)(b)[(i) + 2] << 16) | ((uint32_t)(b)[(i) + 3] << 24); } while (0)
+#define MD5_PUT_UINT32_LE(n,b,i) \
+    do { (b)[i] = (unsigned char)((n) & 0xFF); (b)[(i) + 1] = (unsigned char)(((n) >> 8) & 0xFF); \
+         (b)[(i) + 2] = (unsigned char)(((n) >> 16) & 0xFF); (b)[(i) + 3] = (unsigned char)(((n) >> 24) & 0xFF); } while (0)
+#define MD5_ROTL(x,n) (((x) << (n)) | ((x) >> (32 - (n))))
+#define MD5_F(x,y,z) ((z) ^ ((x) & ((y) ^ (z))))
+#define MD5_G(x,y,z) ((y) ^ ((z) & ((x) ^ (y))))
+#define MD5_H(x,y,z) ((x) ^ (y) ^ (z))
+#define MD5_I(x,y,z) ((y) ^ ((x) | ~(z)))
+#define MD5_STEP(f,a,b,c,d,x,s,t) \
+    do { (a) += f((b), (c), (d)) + (x) + (uint32_t)(t); (a) = MD5_ROTL((a), (s)) + (b); } while (0)
+
+static void utils_md5_process(iot_md5_context *ctx, const unsigned char data[64])
+{
+    uint32_t X[16], A, B, C, D;
+
+    for (int i = 0; i < 16; i++) {
+        MD5_GET_UINT32_LE(X[i], data, i * 4);
+    }
+
+    A = ctx->state[0];
+    B = ctx->state[1];
+    C = ctx->state[2];
+    D = ctx->state[3];
+
+    MD5_STEP(MD5_F, A, B, C, D, X[0], 7, 0xD76AA478);
+    MD5_STEP(MD5_F, D, A, B, C, X[1], 12, 0xE8C7B756);
+    MD5_STEP(MD5_F, C, D, A, B, X[2], 17, 0x242070DB);
+    MD5_STEP(MD5_F, B, C, D, A, X[3], 22, 0xC1BDCEEE);
+    MD5_STEP(MD5_F, A, B, C, D, X[4], 7, 0xF57C0FAF);
+    MD5_STEP(MD5_F, D, A, B, C, X[5], 12, 0x4787C62A);
+    MD5_STEP(MD5_F, C, D, A, B, X[6], 17, 0xA8304613);
+    MD5_STEP(MD5_F, B, C, D, A, X[7], 22, 0xFD469501);
+    MD5_STEP(MD5_F, A, B, C, D, X[8], 7, 0x698098D8);
+    MD5_STEP(MD5_F, D, A, B, C, X[9], 12, 0x8B44F7AF);
+    MD5_STEP(MD5_F, C, D, A, B, X[10], 17, 0xFFFF5BB1);
+    MD5_STEP(MD5_F, B, C, D, A, X[11], 22, 0x895CD7BE);
+    MD5_STEP(MD5_F, A, B, C, D, X[12], 7, 0x6B901122);
+    MD5_STEP(MD5_F, D, A, B, C, X[13], 12, 0xFD987193);
+    MD5_STEP(MD5_F, C, D, A, B, X[14], 17, 0xA679438E);
+    MD5_STEP(MD5_F, B, C, D, A, X[15], 22, 0x49B40821);
+
+    MD5_STEP(MD5_G, A, B, C, D, X[1], 5, 0xF61E2562);
+    MD5_STEP(MD5_G, D, A, B, C, X[6], 9, 0xC040B340);
+    MD5_STEP(MD5_G, C, D, A, B, X[11], 14, 0x265E5A51);
+    MD5_STEP(MD5_G, B, C, D, A, X[0], 20, 0xE9B6C7AA);
+    MD5_STEP(MD5_G, A, B, C, D, X[5], 5, 0xD62F105D);
+    MD5_STEP(MD5_G, D, A, B, C, X[10], 9, 0x02441453);
+    MD5_STEP(MD5_G, C, D, A, B, X[15], 14, 0xD8A1E681);
+    MD5_STEP(MD5_G, B, C, D, A, X[4], 20, 0xE7D3FBC8);
+    MD5_STEP(MD5_G, A, B, C, D, X[9], 5, 0x21E1CDE6);
+    MD5_STEP(MD5_G, D, A, B, C, X[14], 9, 0xC33707D6);
+    MD5_STEP(MD5_G, C, D, A, B, X[3], 14, 0xF4D50D87);
+    MD5_STEP(MD5_G, B, C, D, A, X[8], 20, 0x455A14ED);
+    MD5_STEP(MD5_G, A, B, C, D, X[13], 5, 0xA9E3E905);
+    MD5_STEP(MD5_G, D, A, B, C, X[2], 9, 0xFCEFA3F8);
+    MD5_STEP(MD5_G, C, D, A, B, X[7], 14, 0x676F02D9);
+    MD5_STEP(MD5_G, B, C, D, A, X[12], 20, 0x8D2A4C8A);
+
+    MD5_STEP(MD5_H, A, B, C, D, X[5], 4, 0xFFFA3942);
+    MD5_STEP(MD5_H, D, A, B, C, X[8], 11, 0x8771F681);
+    MD5_STEP(MD5_H, C, D, A, B, X[11], 16, 0x6D9D6122);
+    MD5_STEP(MD5_H, B, C, D, A, X[14], 23, 0xFDE5380C);
+    MD5_STEP(MD5_H, A, B, C, D, X[1], 4, 0xA4BEEA44);
+    MD5_STEP(MD5_H, D, A, B, C, X[4], 11, 0x4BDECFA9);
+    MD5_STEP(MD5_H, C, D, A, B, X[7], 16, 0xF6BB4B60);
+    MD5_STEP(MD5_H, B, C, D, A, X[10], 23, 0xBEBFBC70);
+    MD5_STEP(MD5_H, A, B, C, D, X[13], 4, 0x289B7EC6);
+    MD5_STEP(MD5_H, D, A, B, C, X[0], 11, 0xEAA127FA);
+    MD5_STEP(MD5_H, C, D, A, B, X[3], 16, 0xD4EF3085);
+    MD5_STEP(MD5_H, B, C, D, A, X[6], 23, 0x04881D05);
+    MD5_STEP(MD5_H, A, B, C, D, X[9], 4, 0xD9D4D039);
+    MD5_STEP(MD5_H, D, A, B, C, X[12], 11, 0xE6DB99E5);
+    MD5_STEP(MD5_H, C, D, A, B, X[15], 16, 0x1FA27CF8);
+    MD5_STEP(MD5_H, B, C, D, A, X[2], 23, 0xC4AC5665);
+
+    MD5_STEP(MD5_I, A, B, C, D, X[0], 6, 0xF4292244);
+    MD5_STEP(MD5_I, D, A, B, C, X[7], 10, 0x432AFF97);
+    MD5_STEP(MD5_I, C, D, A, B, X[14], 15, 0xAB9423A7);
+    MD5_STEP(MD5_I, B, C, D, A, X[5], 21, 0xFC93A039);
+    MD5_STEP(MD5_I, A, B, C, D, X[12], 6, 0x655B59C3);
+    MD5_STEP(MD5_I, D, A, B, C, X[3], 10, 0x8F0CCC92);
+    MD5_STEP(MD5_I, C, D, A, B, X[10], 15, 0xFFEFF47D);
+    MD5_STEP(MD5_I, B, C, D, A, X[1], 21, 0x85845DD1);
+    MD5_STEP(MD5_I, A, B, C, D, X[8], 6, 0x6FA87E4F);
+    MD5_STEP(MD5_I, D, A, B, C, X[15], 10, 0xFE2CE6E0);
+    MD5_STEP(MD5_I, C, D, A, B, X[6], 15, 0xA3014314);
+    MD5_STEP(MD5_I, B, C, D, A, X[13], 21, 0x4E0811A1);
+    MD5_STEP(MD5_I, A, B, C, D, X[4], 6, 0xF7537E82);
+    MD5_STEP(MD5_I, D, A, B, C, X[11], 10, 0xBD3AF235);
+    MD5_STEP(MD5_I, C, D, A, B, X[2], 15, 0x2AD7D2BB);
+    MD5_STEP(MD5_I, B, C, D, A, X[9], 21, 0xEB86D391);
+
+    ctx->state[0] += A;
+    ctx->state[1] += B;
+    ctx->state[2] += C;
+    ctx->state[3] += D;
+}
+
+static void utils_md5_init(iot_md5_context *ctx)
+{
+    memset(ctx, 0, sizeof(*ctx));
+}
+
+static void utils_md5_starts(iot_md5_context *ctx)
+{
+    ctx->total[0] = 0;
+    ctx->total[1] = 0;
+    ctx->state[0] = 0x67452301;
+    ctx->state[1] = 0xEFCDAB89;
+    ctx->state[2] = 0x98BADCFE;
+    ctx->state[3] = 0x10325476;
+}
+
+static void utils_md5_update(iot_md5_context *ctx, const unsigned char *input, uint32_t ilen)
+{
+    uint32_t left = ctx->total[0] & 0x3F;
+    uint32_t fill = 64 - left;
+
+    ctx->total[0] += ilen;
+    if (ctx->total[0] < ilen) {
+        ctx->total[1]++;
+    }
+
+    if (left && ilen >= fill) {
+        memcpy(ctx->buffer + left, input, fill);
+        utils_md5_process(ctx, ctx->buffer);
+        input += fill;
+        ilen -= fill;
+        left = 0;
+    }
+
+    while (ilen >= 64) {
+        utils_md5_process(ctx, input);
+        input += 64;
+        ilen -= 64;
+    }
+
+    if (ilen > 0) {
+        memcpy(ctx->buffer + left, input, ilen);
+    }
+}
+
+static const unsigned char md5_padding[64] = {0x80, 0};
+
+static void utils_md5_finish(iot_md5_context *ctx, uint8_t output[16])
+{
+    unsigned char msglen[8];
+    uint32_t high = (ctx->total[0] >> 29) | (ctx->total[1] << 3);
+    uint32_t low = ctx->total[0] << 3;
+    uint32_t last = ctx->total[0] & 0x3F;
+    uint32_t padn = (last < 56) ? (56 - last) : (120 - last);
+
+    MD5_PUT_UINT32_LE(low, msglen, 0);
+    MD5_PUT_UINT32_LE(high, msglen, 4);
+    utils_md5_update(ctx, md5_padding, padn);
+    utils_md5_update(ctx, msglen, 8);
+    MD5_PUT_UINT32_LE(ctx->state[0], output, 0);
+    MD5_PUT_UINT32_LE(ctx->state[1], output, 4);
+    MD5_PUT_UINT32_LE(ctx->state[2], output, 8);
+    MD5_PUT_UINT32_LE(ctx->state[3], output, 12);
 }
 
 static void utils_hmac_sha256(const uint8_t *msg, uint32_t msg_len, const uint8_t *key, uint32_t key_len, uint8_t output[32]) {
@@ -572,8 +794,18 @@ int subdev_init(SubDevice *subdev) {
     }
     printf("[INFO] subdev_init: MQTT连接请求已发送 (dn=%s)，等待连接完成...\n", subdev->dn);
 
-    // 8. 等待连接完成（优化等待时间，从500微秒改为500毫秒，避免连接未完成就标记成功）
-    usleep(500 * 1000); // 500ms，原代码是500微秒（0.5ms），时间过短易误判
+    // 8. 等待连接完成并使用Paho真实连接状态确认，避免异步连接失败后误标记成功。
+    for (int i = 0; i < 20 && !MQTTAsync_isConnected(subdev->client); i++) {
+        usleep(250 * 1000);
+    }
+
+    if (!MQTTAsync_isConnected(subdev->client)) {
+        fprintf(stderr, "[ERROR] subdev_init: 子设备MQTT连接超时或失败 (dn=%s)\n", subdev->dn);
+        MQTTAsync_destroy(&subdev->client);
+        subdev->client = NULL;
+        subdev->connected = 0;
+        return -1;
+    }
 
     // 9. 标记连接状态 + 成功日志
     subdev->connected = 1;
@@ -631,15 +863,551 @@ void subdev_destroy(SubDevice *subdev) {
            subdev->dn ? subdev->dn : "未知设备名");
 }
 
+static const char *ota_json_get_string(cJSON *obj, const char *key1, const char *key2)
+{
+    if (!obj) {
+        return NULL;
+    }
+
+    cJSON *item = cJSON_GetObjectItem(obj, key1);
+    if (!cJSON_IsString(item) && key2) {
+        item = cJSON_GetObjectItem(obj, key2);
+    }
+    return cJSON_IsString(item) ? item->valuestring : NULL;
+}
+
+static int ota_json_get_int(cJSON *obj, const char *key1, const char *key2)
+{
+    if (!obj) {
+        return 0;
+    }
+
+    cJSON *item = cJSON_GetObjectItem(obj, key1);
+    if (!cJSON_IsNumber(item) && key2) {
+        item = cJSON_GetObjectItem(obj, key2);
+    }
+    return cJSON_IsNumber(item) ? item->valueint : 0;
+}
+
+static curl_off_t ota_json_get_size(cJSON *obj, const char *key1, const char *key2)
+{
+    if (!obj) {
+        return 0;
+    }
+
+    cJSON *item = cJSON_GetObjectItem(obj, key1);
+    if (!cJSON_IsNumber(item) && key2) {
+        item = cJSON_GetObjectItem(obj, key2);
+    }
+    return cJSON_IsNumber(item) ? (curl_off_t)item->valuedouble : 0;
+}
+
+static long long ota_now_ms(void)
+{
+    struct timespec ts;
+
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) {
+        return (long long)time(NULL) * 1000LL;
+    }
+    return (long long)ts.tv_sec * 1000LL + ts.tv_nsec / 1000000LL;
+}
+
+static void gw_make_msg_id(char *buf, size_t len)
+{
+    static pthread_mutex_t id_lock = PTHREAD_MUTEX_INITIALIZER;
+    static unsigned long id = 0;
+    unsigned long next_id;
+
+    if (!buf || len == 0) {
+        return;
+    }
+
+    pthread_mutex_lock(&id_lock);
+    next_id = ++id;
+    if (next_id > 4294967295UL || next_id == 0) {
+        id = 1;
+        next_id = 1;
+    }
+    pthread_mutex_unlock(&id_lock);
+
+    snprintf(buf, len, "%lu", next_id);
+}
+
+static int ota_ascii_equal(const char *a, const char *b)
+{
+    if (!a || !b) {
+        return 0;
+    }
+
+    while (*a && *b) {
+        if (tolower((unsigned char)*a) != tolower((unsigned char)*b)) {
+            return 0;
+        }
+        a++;
+        b++;
+    }
+
+    return *a == '\0' && *b == '\0';
+}
+
+static int ota_code_is_success(cJSON *root)
+{
+    cJSON *code;
+
+    if (!root) {
+        return 0;
+    }
+
+    code = cJSON_GetObjectItem(root, "code");
+    if (!code) {
+        return 1;
+    }
+    if (cJSON_IsString(code)) {
+        return strcmp(code->valuestring, "1000") == 0 || strcmp(code->valuestring, "200") == 0;
+    }
+    if (cJSON_IsNumber(code)) {
+        return code->valueint == 1000 || code->valueint == 200;
+    }
+
+    return 0;
+}
+
+static void ota_hex_encode_lower(const uint8_t *input, size_t input_len, char *output, size_t output_len)
+{
+    static const char hex[] = "0123456789abcdef";
+    size_t need = input_len * 2 + 1;
+
+    if (!input || !output || output_len < need) {
+        return;
+    }
+
+    for (size_t i = 0; i < input_len; i++) {
+        output[i * 2] = hex[(input[i] >> 4) & 0x0F];
+        output[i * 2 + 1] = hex[input[i] & 0x0F];
+    }
+    output[input_len * 2] = '\0';
+}
+
+static int ota_normalize_hash(const char *src, char *dst, size_t dst_len)
+{
+    size_t j = 0;
+
+    if (!src || !dst || dst_len == 0) {
+        return 0;
+    }
+
+    for (size_t i = 0; src[i] && j + 1 < dst_len; i++) {
+        unsigned char c = (unsigned char)src[i];
+        if (isspace(c) || c == ':' || c == '-') {
+            continue;
+        }
+        if (!isxdigit(c)) {
+            return 0;
+        }
+        dst[j++] = (char)tolower(c);
+    }
+    dst[j] = '\0';
+    return j == 32 || j == 64;
+}
+
+static int ota_prepare_file_check(OtaDownloadCtx *ctx, const char *sign_method,
+                                  const char *file_sign, const char *file_md5,
+                                  curl_off_t file_size)
+{
+    const char *expected = NULL;
+
+    if (!ctx) {
+        return -1;
+    }
+
+    ctx->file_start_bytes = ctx->downloaded_bytes;
+    ctx->file_expected_size = file_size > 0 ? file_size : 0;
+    ctx->hash_type = OTA_HASH_NONE;
+    ctx->expected_hash[0] = '\0';
+
+    if (sign_method && ota_ascii_equal(sign_method, "SHA256")) {
+        expected = file_sign;
+        ctx->hash_type = OTA_HASH_SHA256;
+    } else {
+        expected = file_md5 ? file_md5 : file_sign;
+        ctx->hash_type = OTA_HASH_MD5;
+    }
+
+    if (!expected || !ota_normalize_hash(expected, ctx->expected_hash, sizeof(ctx->expected_hash))) {
+        ctx->hash_type = OTA_HASH_NONE;
+        return 0;
+    }
+
+    if (strlen(ctx->expected_hash) == 64) {
+        ctx->hash_type = OTA_HASH_SHA256;
+        utils_sha256_init(&ctx->sha256_ctx);
+        utils_sha256_starts(&ctx->sha256_ctx);
+    } else if (strlen(ctx->expected_hash) == 32) {
+        ctx->hash_type = OTA_HASH_MD5;
+        utils_md5_init(&ctx->md5_ctx);
+        utils_md5_starts(&ctx->md5_ctx);
+    } else {
+        ctx->hash_type = OTA_HASH_NONE;
+    }
+
+    return 0;
+}
+
+static int ota_finish_file_check(OtaDownloadCtx *ctx)
+{
+    curl_off_t file_bytes;
+    char actual_hash[65] = {0};
+
+    if (!ctx) {
+        return -1;
+    }
+
+    file_bytes = ctx->downloaded_bytes - ctx->file_start_bytes;
+    if (ctx->file_expected_size > 0 && file_bytes != ctx->file_expected_size) {
+        fprintf(stderr, "[ERROR] OTA 文件大小校验失败：期望=%lld, 实际=%lld\n",
+                (long long)ctx->file_expected_size, (long long)file_bytes);
+        return -1;
+    }
+
+    if (ctx->hash_type == OTA_HASH_MD5) {
+        uint8_t digest[16];
+        utils_md5_finish(&ctx->md5_ctx, digest);
+        ota_hex_encode_lower(digest, sizeof(digest), actual_hash, sizeof(actual_hash));
+    } else if (ctx->hash_type == OTA_HASH_SHA256) {
+        uint8_t digest[32];
+        utils_sha256_finish(&ctx->sha256_ctx, digest);
+        ota_hex_encode_lower(digest, sizeof(digest), actual_hash, sizeof(actual_hash));
+        utils_sha256_free(&ctx->sha256_ctx);
+    } else {
+        return 0;
+    }
+
+    if (strcmp(actual_hash, ctx->expected_hash) != 0) {
+        fprintf(stderr, "[ERROR] OTA 固件摘要校验失败：期望=%s, 实际=%s\n",
+                ctx->expected_hash, actual_hash);
+        return -1;
+    }
+
+    return 0;
+}
+
+static int ota_report_progress_from_ctx(OtaDownloadCtx *ctx, const char *desc, int force)
+{
+    if (!ctx || !ctx->report_progress || ctx->total_bytes <= 0) {
+        return 0;
+    }
+
+    int percent = (int)((ctx->downloaded_bytes * 100) / ctx->total_bytes);
+    if (percent > 100) {
+        percent = 100;
+    }
+
+    int report_percent = (percent / 10) * 10;
+    if (force) {
+        report_percent = percent;
+    }
+
+    long long now_ms = ota_now_ms();
+    if (force ||
+        (report_percent > ctx->last_report_percent &&
+         now_ms - ctx->last_report_ms >= OTA_PROGRESS_MIN_INTERVAL_MS)) {
+        ctx->last_report_percent = report_percent;
+        ctx->last_report_ms = now_ms;
+        return gw_ota_report_progress_percent(report_percent, desc, ctx->module);
+    }
+
+    return 0;
+}
+
+static int ota_start_task(const char *payload)
+{
+    if (!payload) {
+        return -1;
+    }
+
+    pthread_mutex_lock(&g_ota_task_lock);
+    if (g_ota_task_running) {
+        pthread_mutex_unlock(&g_ota_task_lock);
+        fprintf(stderr, "[OTA SDK] 已有OTA任务正在执行，拒绝新的OTA任务\n");
+        return -1;
+    }
+    g_ota_task_running = 1;
+    pthread_mutex_unlock(&g_ota_task_lock);
+
+    OtaTask *task = calloc(1, sizeof(OtaTask));
+    if (!task) {
+        pthread_mutex_lock(&g_ota_task_lock);
+        g_ota_task_running = 0;
+        pthread_mutex_unlock(&g_ota_task_lock);
+        return -1;
+    }
+
+    size_t len = strlen(payload);
+    task->payload = malloc(len + 1);
+    if (!task->payload) {
+        free(task);
+        pthread_mutex_lock(&g_ota_task_lock);
+        g_ota_task_running = 0;
+        pthread_mutex_unlock(&g_ota_task_lock);
+        return -1;
+    }
+    memcpy(task->payload, payload, len + 1);
+
+    pthread_t tid;
+    int ret = pthread_create(&tid, NULL, ota_task_thread, task);
+    if (ret != 0) {
+        free(task->payload);
+        free(task);
+        pthread_mutex_lock(&g_ota_task_lock);
+        g_ota_task_running = 0;
+        pthread_mutex_unlock(&g_ota_task_lock);
+        return -1;
+    }
+
+    pthread_detach(tid);
+    return 0;
+}
+
+static void *ota_task_thread(void *arg)
+{
+    OtaTask *task = (OtaTask *)arg;
+    cJSON *root = NULL;
+
+    if (!task || !task->payload) {
+        goto cleanup;
+    }
+
+    root = cJSON_Parse(task->payload);
+    if (!root) {
+        fprintf(stderr, "[OTA SDK] OTA任务JSON解析失败\n");
+        gw_ota_report_progress("-1", "OTA任务解析失败", NULL);
+        goto cleanup;
+    }
+
+    if (!ota_code_is_success(root)) {
+        fprintf(stderr, "[OTA SDK] OTA任务返回码不是成功状态，忽略本次任务\n");
+        gw_ota_report_progress("-1", "OTA任务返回码异常", NULL);
+        goto cleanup;
+    }
+
+    cJSON *data = cJSON_GetObjectItem(root, "data");
+    if (!cJSON_IsObject(data)) {
+        data = root;
+    }
+
+    const char *version = ota_json_get_string(data, "version", NULL);
+    const char *module = ota_json_get_string(data, "module", NULL);
+    const char *sign_method = ota_json_get_string(data, "signMethod", NULL);
+    int is_diff = ota_json_get_int(data, "isDiff", NULL);
+
+    if (!version) {
+        version = "unknown";
+    }
+    if (!module) {
+        module = "default";
+    }
+    if (!sign_method) {
+        sign_method = "MD5";
+    }
+
+    if (!g_user_ota_data_cb) {
+        fprintf(stderr, "[OTA SDK] 未注册OTA下载数据处理回调\n");
+        gw_ota_report_progress("-1", "未注册OTA数据处理回调", module);
+        goto cleanup;
+    }
+
+    cJSON *files = cJSON_GetObjectItem(data, "files");
+    int ret = OTA_DOWNLOAD_ERROR;
+
+    if (cJSON_IsArray(files)) {
+        int file_cnt = cJSON_GetArraySize(files);
+        curl_off_t total_size = 0;
+
+        if (file_cnt <= 0) {
+            fprintf(stderr, "[OTA SDK] 多文件OTA文件列表为空\n");
+            gw_ota_report_progress("-2", "下载失败：文件列表为空", module);
+            goto cleanup;
+        }
+
+        for (int i = 0; i < file_cnt; i++) {
+            cJSON *file = cJSON_GetArrayItem(files, i);
+            total_size += ota_json_get_size(file, "size", "fileSize");
+        }
+
+        if (g_user_ota_callback) {
+            g_user_ota_callback((char *)module, (char *)version, (char *)sign_method,
+                                is_diff, NULL, NULL, NULL, 0, files, file_cnt);
+        }
+
+        OtaDownloadCtx dl_ctx = {
+            .data_cb = g_user_ota_data_cb,
+            .module = module,
+            .total_bytes = total_size,
+            .downloaded_bytes = 0,
+            .file_start_bytes = 0,
+            .file_expected_size = 0,
+            .last_report_percent = -1,
+            .last_report_ms = 0,
+            .report_progress = total_size > 0,
+            .user_error = 0,
+            .hash_type = OTA_HASH_NONE
+        };
+
+        gw_ota_report_progress_percent(0, "开始下载", module);
+        dl_ctx.last_report_percent = 0;
+        dl_ctx.last_report_ms = ota_now_ms();
+
+        for (int i = 0; i < file_cnt; i++) {
+            cJSON *file = cJSON_GetArrayItem(files, i);
+            const char *file_name = ota_json_get_string(file, "fileName", "name");
+            const char *file_url = ota_json_get_string(file, "url", "fileUrl");
+            const char *file_sign = ota_json_get_string(file, "sign", "fileSign");
+            const char *file_md5 = ota_json_get_string(file, "md5", "fileMd5");
+            const char *dprotocol = ota_json_get_string(file, "dProtocol", NULL);
+            curl_off_t file_size = ota_json_get_size(file, "size", "fileSize");
+
+            if (dprotocol && ota_ascii_equal(dprotocol, "mqtt")) {
+                fprintf(stderr, "[OTA SDK] 当前版本不支持MQTT协议OTA下载\n");
+                gw_ota_report_progress("-2", "下载失败：不支持MQTT下载协议", module);
+                ret = OTA_DOWNLOAD_ERROR;
+                goto cleanup;
+            }
+
+            if (!file_url) {
+                fprintf(stderr, "[OTA SDK] 多文件OTA缺少fileUrl/url字段\n");
+                gw_ota_report_progress("-2", "下载失败：缺少文件URL", module);
+                ret = OTA_DOWNLOAD_ERROR;
+                goto cleanup;
+            }
+
+            if (!file_name) {
+                file_name = "unknown";
+            }
+            if (g_user_ota_file_start_cb) {
+                g_user_ota_file_start_cb(file_name, i + 1, file_cnt);
+            }
+
+            ota_prepare_file_check(&dl_ctx, sign_method, file_sign, file_md5, file_size);
+            ret = ota_download_file_internal(file_url, &dl_ctx);
+            if (ret != OTA_DOWNLOAD_OK) {
+                gw_ota_report_progress(dl_ctx.user_error ? "-4" : "-2",
+                                       dl_ctx.user_error ? "固件数据处理失败" : "下载失败",
+                                       module);
+                goto cleanup;
+            }
+
+            if (ota_finish_file_check(&dl_ctx) != 0) {
+                gw_ota_report_progress("-3", "固件校验失败", module);
+                goto cleanup;
+            }
+
+            if (g_user_ota_file_finish_cb &&
+                g_user_ota_file_finish_cb(file_name, i + 1, file_cnt) != 0) {
+                gw_ota_report_progress("-4", "固件烧录失败", module);
+                goto cleanup;
+            }
+        }
+
+        gw_ota_report_progress_percent(100, "下载完成", module);
+        gw_ota_report_version(version, module);
+    } else {
+        const char *url = ota_json_get_string(data, "url", "fileUrl");
+        const char *sign = ota_json_get_string(data, "sign", "fileSign");
+        const char *md5 = ota_json_get_string(data, "md5", "fileMd5");
+        curl_off_t size = ota_json_get_size(data, "size", "fileSize");
+        const char *file_name = ota_json_get_string(data, "fileName", "name");
+        const char *dprotocol = ota_json_get_string(data, "dProtocol", NULL);
+
+        if (dprotocol && ota_ascii_equal(dprotocol, "mqtt")) {
+            fprintf(stderr, "[OTA SDK] 当前版本不支持MQTT协议OTA下载\n");
+            gw_ota_report_progress("-2", "下载失败：不支持MQTT下载协议", module);
+            goto cleanup;
+        }
+
+        if (!url) {
+            fprintf(stderr, "[OTA SDK] 单文件OTA缺少url/fileUrl字段\n");
+            gw_ota_report_progress("-2", "下载失败：缺少文件URL", module);
+            goto cleanup;
+        }
+
+        if (g_user_ota_callback) {
+            g_user_ota_callback((char *)module, (char *)version, (char *)sign_method,
+                                is_diff, (char *)url, (char *)sign, (char *)md5,
+                                size > INT32_MAX ? INT32_MAX : (int)size, NULL, 0);
+        }
+
+        if (g_user_ota_file_start_cb) {
+            g_user_ota_file_start_cb(file_name ? file_name : "default", 1, 1);
+        }
+
+        OtaDownloadCtx dl_ctx = {
+            .data_cb = g_user_ota_data_cb,
+            .module = module,
+            .total_bytes = size,
+            .downloaded_bytes = 0,
+            .file_start_bytes = 0,
+            .file_expected_size = 0,
+            .last_report_percent = -1,
+            .last_report_ms = 0,
+            .report_progress = 1,
+            .user_error = 0,
+            .hash_type = OTA_HASH_NONE
+        };
+
+        gw_ota_report_progress_percent(0, "开始下载", module);
+        dl_ctx.last_report_percent = 0;
+        dl_ctx.last_report_ms = ota_now_ms();
+        ota_prepare_file_check(&dl_ctx, sign_method, sign, md5, size);
+        ret = ota_download_file_internal(url, &dl_ctx);
+        if (ret == OTA_DOWNLOAD_OK) {
+            if (ota_finish_file_check(&dl_ctx) != 0) {
+                gw_ota_report_progress("-3", "固件校验失败", module);
+                goto cleanup;
+            }
+            if (g_user_ota_file_finish_cb &&
+                g_user_ota_file_finish_cb(file_name ? file_name : "default", 1, 1) != 0) {
+                gw_ota_report_progress("-4", "固件烧录失败", module);
+                goto cleanup;
+            }
+            gw_ota_report_progress_percent(100, "下载完成", module);
+            gw_ota_report_version(version, module);
+        } else {
+            gw_ota_report_progress(dl_ctx.user_error ? "-4" : "-2",
+                                   dl_ctx.user_error ? "固件数据处理失败" : "下载失败",
+                                   module);
+        }
+    }
+
+cleanup:
+    if (root) {
+        cJSON_Delete(root);
+    }
+    if (task) {
+        free(task->payload);
+        free(task);
+    }
+    pthread_mutex_lock(&g_ota_task_lock);
+    g_ota_task_running = 0;
+    pthread_mutex_unlock(&g_ota_task_lock);
+    return NULL;
+}
+
 //=====================================================================
 // 网关下行指令处理
 //=====================================================================
 static int gw_on_message(void *ctx, char *topic, int tlen, MQTTAsync_message *msg) {
     // 1. 安全读取 payload，防止越界
-    char payload[1024] = {0};
-    int len = msg->payloadlen < 1023 ? msg->payloadlen : 1023;
-    strncpy(payload, msg->payload, len);
+    char *payload = malloc(msg->payloadlen + 1);
+    if (!payload) {
+        fprintf(stderr, "[ERROR] gw_on_message: payload内存分配失败\n");
+        MQTTAsync_freeMessage(&msg);
+        MQTTAsync_free(topic);
+        return 1;
+    }
+    int len = msg->payloadlen;
+    memcpy(payload, msg->payload, len);
     payload[len] = '\0';
+#define GW_FREE_MESSAGE() do { free(payload); MQTTAsync_freeMessage(&msg); MQTTAsync_free(topic); } while (0)
     printf("[down] 收到下行指令: %s\n", payload);
     // ====================== 【你要的打印：接收数据】 ======================
     printf("\n=============================================\n");
@@ -649,88 +1417,12 @@ static int gw_on_message(void *ctx, char *topic, int tlen, MQTTAsync_message *ms
     // ====================================================================
 
     if (strstr(topic, "/ota/device/upgrade/") != NULL) {
-        printf("[OTA SDK] 收到阿里云 OTA 升级通知\n");
-
-        cJSON *root = cJSON_Parse(payload);
-        if (!root) {
-            fprintf(stderr, "[OTA SDK] JSON 解析失败\n");
-            goto exit_ota;
+        printf("[OTA SDK] 收到阿里云 OTA 升级通知，创建OTA任务线程\n");
+        if (ota_start_task(payload) != 0) {
+            fprintf(stderr, "[OTA SDK] 创建OTA任务线程失败\n");
+            gw_ota_report_progress("-1", "创建OTA任务线程失败", NULL);
         }
-
-        cJSON *data = cJSON_GetObjectItem(root, "data");
-        if (!data) {
-            fprintf(stderr, "[OTA SDK] 无 data 字段\n");
-            goto exit_ota;
-        }
-
-        // 通用字段
-        char *version    = cJSON_GetStringValue(cJSON_GetObjectItem(data, "version"));
-        char *module     = cJSON_GetStringValue(cJSON_GetObjectItem(data, "module"));
-        char *signMethod = cJSON_GetStringValue(cJSON_GetObjectItem(data, "signMethod"));
-        int   isDiff     = cJSON_GetNumberValue(cJSON_GetObjectItem(data, "isDiff"));
-
-        if (!version) version = "unknown";
-        if (!module) module = "default";
-        if (!signMethod) signMethod = "MD5";
-
-        printf("[OTA SDK] 版本: %s | 模块: %s | 差分包: %d\n", version, module, isDiff);
-
-        // ====================== 判断：单文件包 OR 多文件包 ======================
-        cJSON *files = cJSON_GetObjectItem(data, "files");
-
-        // -------------------- 单文件包 --------------------
-        if (!files) {
-            char *url     = cJSON_GetStringValue(cJSON_GetObjectItem(data, "url"));
-            char *sign    = cJSON_GetStringValue(cJSON_GetObjectItem(data, "sign"));
-            char *md5     = cJSON_GetStringValue(cJSON_GetObjectItem(data, "md5"));
-            int   size    = cJSON_GetNumberValue(cJSON_GetObjectItem(data, "size"));
-
-            printf("[OTA SDK] 类型: 单文件包\n");
-            printf("[OTA SDK] URL: %s\n", url ? url : "null");
-            printf("[OTA SDK] SIGN: %s\n", sign ? sign : "null");
-
-            // 用户回调：单文件
-            if (g_user_ota_callback != NULL) {
-                g_user_ota_callback(
-                    module,
-                    version,
-                    signMethod,
-                    isDiff,
-                    url,
-                    sign,
-                    md5,
-                    size,
-                    NULL,   // files 数组传 NULL
-                    0       // 文件数量 0
-                );
-            }
-        }
-        // -------------------- 多文件包 --------------------
-        else if (cJSON_IsArray(files)) {
-            int file_cnt = cJSON_GetArraySize(files);
-            printf("[OTA SDK] 类型: 多文件包 | 文件数量: %d\n", file_cnt);
-
-            // 把 files 数组原样传给用户（让用户自己遍历解析）
-            if (g_user_ota_callback != NULL) {
-                g_user_ota_callback(
-                    module,
-                    version,
-                    signMethod,
-                    isDiff,
-                    NULL,    // 单文件url传NULL
-                    NULL,
-                    NULL,
-                    0,
-                    files,  // 传递文件数组
-                    file_cnt
-                );
-            }
-        }
-
-        exit_ota:
-        if (root) cJSON_Delete(root);
-        MQTTAsync_freeMessage(&msg);
-        MQTTAsync_free(topic);
+        GW_FREE_MESSAGE();
         return 0;
     }
     
@@ -740,8 +1432,7 @@ static int gw_on_message(void *ctx, char *topic, int tlen, MQTTAsync_message *ms
         const char *error_info = cJSON_GetErrorPtr();
         fprintf(stderr, "[ERROR] gw_on_message: 解析下行指令JSON失败, 错误位置: %s\n", 
                 error_info ? error_info : "未知位置");
-        MQTTAsync_freeMessage(&msg);
-        MQTTAsync_free(topic);
+        GW_FREE_MESSAGE();
         return 1;
     }
 
@@ -751,8 +1442,7 @@ static int gw_on_message(void *ctx, char *topic, int tlen, MQTTAsync_message *ms
     if (ret != 0) {
         fprintf(stderr, "[ERROR] gw_on_message: 解析 method 失败\n");
         cJSON_Delete(root);
-        MQTTAsync_freeMessage(&msg);
-        MQTTAsync_free(topic);
+        GW_FREE_MESSAGE();
         return 1;
     }
 
@@ -773,8 +1463,7 @@ static int gw_on_message(void *ctx, char *topic, int tlen, MQTTAsync_message *ms
             // 自定义拦截，直接释放资源退出
             if(params_json) free(params_json);
             cJSON_Delete(root);
-            MQTTAsync_freeMessage(&msg);
-            MQTTAsync_free(topic);
+            GW_FREE_MESSAGE();
             return 0;
         }
     }
@@ -786,8 +1475,7 @@ static int gw_on_message(void *ctx, char *topic, int tlen, MQTTAsync_message *ms
         printf("[WARN] gw_on_message: 忽略非路由指令, method=%s\n", method);
         cJSON_Delete(root);
         if(params_json) free(params_json);
-        MQTTAsync_freeMessage(&msg);
-        MQTTAsync_free(topic);
+        GW_FREE_MESSAGE();
         return 1;
     }
 
@@ -796,15 +1484,13 @@ static int gw_on_message(void *ctx, char *topic, int tlen, MQTTAsync_message *ms
         fprintf(stderr, "[ERROR] gw_on_message: params 字段不存在或不是对象类型\n");
         cJSON_Delete(root);
         if(params_json) free(params_json);
-        MQTTAsync_freeMessage(&msg);
-        MQTTAsync_free(topic);
+        GW_FREE_MESSAGE();
         return 1;
     }
     if (!params_json) {
         fprintf(stderr, "[ERROR] gw_on_message: 将 params 对象转为字符串失败\n");
         cJSON_Delete(root);
-        MQTTAsync_freeMessage(&msg);
-        MQTTAsync_free(topic);
+        GW_FREE_MESSAGE();
         return 1;
     }
     printf("[INFO] gw_on_message: 解析到 params: %s\n", params_json);
@@ -819,16 +1505,93 @@ static int gw_on_message(void *ctx, char *topic, int tlen, MQTTAsync_message *ms
         fprintf(stderr, "[ERROR] gw_on_message: 解析 params 中的 cmd 失败\n");
         cJSON_Delete(root);
         free(params_json);
-        MQTTAsync_freeMessage(&msg);
-        MQTTAsync_free(topic);
+        GW_FREE_MESSAGE();
         return 1;
     }
 
-    // 最后资源释放（原有逻辑不变）
+    // 提取通用参数
+    ret = json_get_str(params_json, "sub_pk", sub_pk, sizeof(sub_pk));
+    if (ret != 0) {
+        fprintf(stderr, "[ERROR] gw_on_message: 解析 params 中的 sub_pk 失败\n");
+        cJSON_Delete(root);
+        free(params_json);
+        GW_FREE_MESSAGE();
+        return 1;
+    }
+    ret = json_get_str(params_json, "sub_dn", sub_dn, sizeof(sub_dn));
+    if (ret != 0) {
+        fprintf(stderr, "[ERROR] gw_on_message: 解析 params 中的 sub_dn 失败\n");
+        cJSON_Delete(root);
+        free(params_json);
+        GW_FREE_MESSAGE();
+        return 1;
+    }
+    ret = json_get_str(params_json, "sub_ds", sub_ds, sizeof(sub_ds));
+    if (ret != 0) {
+        fprintf(stderr, "[ERROR] gw_on_message: 解析 params 中的 sub_ds 失败\n");
+        cJSON_Delete(root);
+        free(params_json);
+        GW_FREE_MESSAGE();
+        return 1;
+    }
+
+    // 处理添加路由（需要 type/sub_pk/sub_dn/sub_ds）
+    if (strcmp(cmd, "add_rule") == 0) {
+        ret = json_get_str(params_json, "key", key, sizeof(key));
+        if (ret != 0) {
+            fprintf(stderr, "[ERROR] gw_on_message: 解析 params 中的 key 失败\n");
+            cJSON_Delete(root);
+            free(params_json);
+            GW_FREE_MESSAGE();
+            return 1;
+        }
+        ret = json_get_str(params_json, "val", val, sizeof(val));
+        if (ret != 0) {
+            fprintf(stderr, "[ERROR] gw_on_message: 解析 params 中的 val 失败\n");
+            cJSON_Delete(root);
+            free(params_json);
+            GW_FREE_MESSAGE();
+            return 1;
+        }
+        // 提取 type
+        ret = json_get_str(params_json, "type", type, sizeof(type));
+        if (ret != 0) {
+            fprintf(stderr, "[ERROR] gw_on_message: 解析 params 中的 type 失败\n");
+            cJSON_Delete(root);
+            free(params_json);
+            GW_FREE_MESSAGE();
+            return 1;
+        }
+        // 提取子设备信息
+
+        // 转换规则类型并添加路由
+        RuleType t = (strcmp(type, "num") == 0) ? RULE_NUM : RULE_STR;
+        ret = gw_add_rule(t, key, val, sub_pk, sub_dn, sub_ds);
+        if (ret == 0) {
+            printf("[INFO] gw_on_message: 添加路由规则成功, cmd=%s, key=%s, val=%s\n", cmd, key, val);
+        } else {
+            fprintf(stderr, "[ERROR] gw_on_message: 添加路由规则失败, cmd=%s, key=%s, val=%s\n", cmd, key, val);
+        }
+    }
+    // 处理删除路由（仅需要 key/val）
+    else if (strcmp(cmd, "del_rule") == 0) {
+        ret = gw_del_rule(sub_pk, sub_dn, sub_ds);
+        if (ret == 0) {
+            printf("[INFO] gw_on_message: 删除路由规则成功, name=%s\n", sub_dn);
+        } else {
+            fprintf(stderr, "[ERROR] gw_on_message: 删除路由规则失败, cmd=%s, key=%s, val=%s\n", cmd, key, val);
+        }
+    }
+    // 未知指令
+    else {
+        fprintf(stderr, "[ERROR] gw_on_message: 未知指令, cmd=%s\n", cmd);
+    }
+
+    // 释放资源（关键：手动释放 cJSON 生成的字符串）
     cJSON_Delete(root);
-    free(params_json);
-    MQTTAsync_freeMessage(&msg);
-    MQTTAsync_free(topic);
+    free(params_json); // 释放 cJSON_PrintUnformatted 生成的字符串
+    GW_FREE_MESSAGE();
+#undef GW_FREE_MESSAGE
     return 0;
 }
 
@@ -836,10 +1599,25 @@ static int gw_on_message(void *ctx, char *topic, int tlen, MQTTAsync_message *ms
 // 网关初始化
 //=====================================================================
 static void trim(char *s) {
-    int len = strlen(s);
-    while (len > 0 && isspace(s[len-1])) len--;
-    s[len] = 0;
-    while (*s && isspace(*s)) s++;
+    char *start = s;
+    char *end = NULL;
+
+    if (!s) {
+        return;
+    }
+
+    while (*start && isspace((unsigned char)*start)) {
+        start++;
+    }
+    if (start != s) {
+        memmove(s, start, strlen(start) + 1);
+    }
+
+    end = s + strlen(s);
+    while (end > s && isspace((unsigned char)*(end - 1))) {
+        end--;
+    }
+    *end = '\0';
 }
 
 int gw_init(const char *cfg_path) {
@@ -864,7 +1642,7 @@ int gw_init(const char *cfg_path) {
     // 3. 打开配置文件 + 错误打印
     FILE *f = fopen(cfg_path, "r");
     if (!f) {
-        printf("[ERROR] gw_init: 打开配置文件失败, path=%s, errno=%d\n", cfg_path);
+        printf("[ERROR] gw_init: 打开配置文件失败, path=%s, errno=%d\n", cfg_path, errno);
         pthread_rwlock_destroy(&g_route.lock); // 释放已初始化的锁
         return -1;
     }
@@ -1048,9 +1826,17 @@ int gw_init(const char *cfg_path) {
     }
     printf("[INFO] gw_init: 网关MQTT连接请求已发送, 等待连接完成...\n");
 
-    // 等待连接完成（增加超时判断）
-    sleep(1);
-    // 校验连接状态（可选：如果MQTT库支持获取连接状态，可添加）
+    // 等待连接完成并使用Paho真实连接状态确认，避免异步连接失败后误标记成功。
+    for (int i = 0; i < 20 && !MQTTAsync_isConnected(g_gw.client); i++) {
+        usleep(250 * 1000);
+    }
+    if (!MQTTAsync_isConnected(g_gw.client)) {
+        fprintf(stderr, "[ERROR] gw_init: 网关MQTT连接超时或失败, broker=%s\n", g_gw.broker);
+        MQTTAsync_destroy(&g_gw.client);
+        pthread_rwlock_destroy(&g_route.lock);
+        return -1;
+    }
+
     g_gw.connected = 1;
     printf("[INFO] gw_init: 网关MQTT连接成功\n");
 
@@ -1185,11 +1971,14 @@ void gw_destroy(void) {
 // 路由匹配
 //=====================================================================
 const char *gw_route_match(const char *json) {
+    static __thread char matched_dn[DEVICENAME_MAXLEN];
+
     // 1. 入参合法性校验 + 错误日志
     if (json == NULL || strlen(json) == 0) {
         fprintf(stderr, "[ERROR] gw_route_match: 输入JSON字符串为空\n");
         return NULL;
     }
+    matched_dn[0] = '\0';
     printf("[INFO] gw_route_match: 开始匹配路由规则 (json=%s)\n", json);
 
     // 2. 解析JSON根节点 + 错误日志
@@ -1257,7 +2046,9 @@ const char *gw_route_match(const char *json) {
 
         // 匹配成功，记录子设备dn并退出循环
         if (match) {
-            match_dn = r->subdev.dn;
+            strncpy(matched_dn, r->subdev.dn, sizeof(matched_dn) - 1);
+            matched_dn[sizeof(matched_dn) - 1] = '\0';
+            match_dn = matched_dn;
             printf("[INFO] gw_route_match: 路由匹配成功 (key=%s, 子设备dn=%s)\n", r->key, match_dn);
             break;
         }
@@ -1340,9 +2131,9 @@ char *build_alink_payload(const char *raw_json)
     cJSON *root = cJSON_CreateObject();
     if (!root) { cJSON_Delete(params); return NULL; }
 
-    /* 1) id：使用时间戳生成一个简单唯一 ID */
+    /* 1) id：全局递增，避免同一秒内多次上报时重复 */
     char id_buf[32];
-    snprintf(id_buf, sizeof(id_buf), "%ld", time(NULL));
+    gw_make_msg_id(id_buf, sizeof(id_buf));
     cJSON_AddStringToObject(root, "id", id_buf);
 
     /* 2) 固定字段 */
@@ -1412,7 +2203,7 @@ int gw_publish_subdev(SubDevice *subdev, const char *payload) {
     msg.payload = (void *)payload;
     msg.payloadlen = strlen(payload);
     msg.qos = 1; // QoS1 确保消息送达
-    printf("[INFO] gw_publish_subdev: 准备上报消息 (dn=%s, payload=%s, payload长度=%lu)\n",
+    printf("[INFO] gw_publish_subdev: 准备上报消息 (dn=%s, payload=%s, payload长度=%d)\n",
            subdev->dn, payload, msg.payloadlen);
 
     // 6. 发送MQTT消息 + 错误日志
@@ -1426,6 +2217,38 @@ int gw_publish_subdev(SubDevice *subdev, const char *payload) {
 
     printf("[INFO] gw_publish_subdev: MQTT消息上报成功 (dn=%s)\n", subdev->dn);
     return 0;
+}
+
+int gw_publish_subdev_by_name(const char *dn, const char *payload)
+{
+    if (!dn || strlen(dn) == 0 || !payload || strlen(payload) == 0) {
+        fprintf(stderr, "[ERROR] gw_publish_subdev_by_name: 参数错误\n");
+        return -1;
+    }
+
+    int lock_ret = pthread_rwlock_rdlock(&g_route.lock);
+    if (lock_ret != 0) {
+        fprintf(stderr, "[ERROR] gw_publish_subdev_by_name: 获取路由表读锁失败, errno=%d\n", lock_ret);
+        return -1;
+    }
+
+    SubDevice *subdev = NULL;
+    for (int i = 0; i < g_route.count; i++) {
+        if (strcmp(g_route.rules[i].subdev.dn, dn) == 0) {
+            subdev = &g_route.rules[i].subdev;
+            break;
+        }
+    }
+
+    int ret = -1;
+    if (subdev) {
+        ret = gw_publish_subdev(subdev, payload);
+    } else {
+        fprintf(stderr, "[ERROR] gw_publish_subdev_by_name: 未找到子设备 (dn=%s)\n", dn);
+    }
+
+    pthread_rwlock_unlock(&g_route.lock);
+    return ret;
 }
 
 
@@ -1542,10 +2365,18 @@ int gw_add_rule(RuleType type, const char *key, const char *val,
     ret = subdev_init(&r->subdev);
     if (ret != 0) {
         fprintf(stderr, "[ERROR] gw_add_rule: 子设备初始化失败 (dn=%s, ret=%d)\n", sub_dn, ret);
-        // 可选：初始化失败时删除已添加的规则（根据业务需求）
-        // pthread_rwlock_wrlock(&g_route.lock);
-        // g_route.count--;
-        // pthread_rwlock_unlock(&g_route.lock);
+        if (pthread_rwlock_wrlock(&g_route.lock) == 0) {
+            for (int i = 0; i < g_route.count; i++) {
+                if (strcmp(g_route.rules[i].subdev.dn, sub_dn) == 0) {
+                    for (int j = i; j < g_route.count - 1; j++) {
+                        g_route.rules[j] = g_route.rules[j + 1];
+                    }
+                    g_route.count--;
+                    break;
+                }
+            }
+            pthread_rwlock_unlock(&g_route.lock);
+        }
         return -1;
     }
 
@@ -1610,6 +2441,21 @@ void gw_register_ota_callback(ota_callback_t cb)
     g_user_ota_callback = cb;
 }
 
+void gw_register_ota_data_callback(ota_data_cb cb)
+{
+    g_user_ota_data_cb = cb;
+}
+
+void gw_register_ota_file_start_callback(ota_file_start_cb cb)
+{
+    g_user_ota_file_start_cb = cb;
+}
+
+void gw_register_ota_file_finish_callback(ota_file_finish_cb cb)
+{
+    g_user_ota_file_finish_cb = cb;
+}
+
 int gw_ota_report_version(const char *version, const char *module)
 {
     if (version == NULL || strlen(version) == 0) {
@@ -1625,8 +2471,11 @@ int gw_ota_report_version(const char *version, const char *module)
              g_gw.dn);
 
     // 2. 构建上报 JSON
+    char id[16];
+    gw_make_msg_id(id, sizeof(id));
+
     cJSON *root = cJSON_CreateObject();
-    cJSON_AddNumberToObject(root, "id", 1);
+    cJSON_AddStringToObject(root, "id", id);
 
     cJSON *params = cJSON_CreateObject();
     cJSON_AddStringToObject(params, "version", version);
@@ -1692,8 +2541,11 @@ int gw_ota_report_progress(const char *step, const char *desc, const char *modul
              g_gw.pk, g_gw.dn);
 
     // ===================== 2024 阿里云官方 JSON 格式 =====================
+    char id[16];
+    gw_make_msg_id(id, sizeof(id));
+
     cJSON *root = cJSON_CreateObject();
-    cJSON_AddStringToObject(root, "id", "1");  // 官方要求：字符串类型数字
+    cJSON_AddStringToObject(root, "id", id);  // 官方要求：字符串类型数字，且同一连接内尽量保持唯一
 
     cJSON *params = cJSON_CreateObject();
     cJSON_AddStringToObject(params, "step", step);
@@ -1731,15 +2583,31 @@ int gw_ota_report_progress(const char *step, const char *desc, const char *modul
     return rc;
 }
 
-// 进度上报（内部直接上报阿里云）
-static int dl_progress(void *mod, curl_off_t total, curl_off_t now, curl_off_t, curl_off_t)
+int gw_ota_report_progress_percent(int percent, const char *desc, const char *module)
 {
-    if (total <= 0) return 0;
-
-    int percent = (now * 100) / total;
     char step[8];
+
+    if (percent < 0) {
+        percent = 0;
+    } else if (percent > 100) {
+        percent = 100;
+    }
+
     snprintf(step, sizeof(step), "%d", percent);
-    gw_ota_report_progress(step, "下载中", (const char *)mod);
+    return gw_ota_report_progress(step, desc ? desc : "下载中", module);
+}
+
+// 进度上报（内部直接上报阿里云）
+static int dl_progress(void *userp, curl_off_t total, curl_off_t now, curl_off_t ultotal, curl_off_t ulnow)
+{
+    (void)now;
+    (void)ultotal;
+    (void)ulnow;
+
+    OtaDownloadCtx *ctx = (OtaDownloadCtx *)userp;
+    if (ctx && ctx->report_progress && ctx->total_bytes <= 0 && total > 0) {
+        ctx->total_bytes = total;
+    }
     return 0;
 }
 
@@ -1757,15 +2625,21 @@ static size_t dl_write_cb(void *data, size_t size, size_t nmemb, void *userp)
         ctx->user_error = 1;
         return 0;
     }
+
+    if (ctx->hash_type == OTA_HASH_MD5) {
+        utils_md5_update(&ctx->md5_ctx, (const unsigned char *)data, (uint32_t)real_len);
+    } else if (ctx->hash_type == OTA_HASH_SHA256) {
+        utils_sha256_update(&ctx->sha256_ctx, (const unsigned char *)data, (uint32_t)real_len);
+    }
+
+    ctx->downloaded_bytes += real_len;
+    ota_report_progress_from_ctx(ctx, "下载中", 0);
     return real_len;
 }
 
-// ======================
-// 单文件流式下载
-// ======================
-int ota_download_file(const char *url, const char *module, ota_data_cb data_cb)
+static int ota_download_file_internal(const char *url, OtaDownloadCtx *ctx)
 {
-    if (!url || strlen(url) == 0 || !data_cb) {
+    if (!url || strlen(url) == 0 || !ctx || !ctx->data_cb) {
         fprintf(stderr, "[ERROR] OTA 下载失败：url/data_cb 不能为空\n");
         return OTA_DOWNLOAD_ERROR;
     }
@@ -1773,31 +2647,28 @@ int ota_download_file(const char *url, const char *module, ota_data_cb data_cb)
     CURL *curl = curl_easy_init();
     if (!curl) return OTA_DOWNLOAD_ERROR;
 
-    OtaDownloadCtx ctx = {
-        .data_cb = data_cb,
-        .user_error = 0
-    };
-
     curl_easy_setopt(curl, CURLOPT_URL, url);
     curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
-    curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 0L);
-    curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 0L);
+    curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 1L);
+    curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 2L);
     curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
     curl_easy_setopt(curl, CURLOPT_TIMEOUT, 15 * 60);
 
     // 流式回调
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, dl_write_cb);
-    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &ctx);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, ctx);
 
     // 进度
     curl_easy_setopt(curl, CURLOPT_XFERINFOFUNCTION, dl_progress);
-    curl_easy_setopt(curl, CURLOPT_XFERINFODATA, (void *)module);
+    curl_easy_setopt(curl, CURLOPT_XFERINFODATA, ctx);
     curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 0L);
 
     CURLcode ret = curl_easy_perform(curl);
+    long response_code = 0;
+    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &response_code);
     curl_easy_cleanup(curl);
 
-    if (ctx.user_error) {
+    if (ctx->user_error) {
         fprintf(stderr, "[ERROR] OTA 下载中止：用户数据处理回调返回失败\n");
         return OTA_DOWNLOAD_ERROR;
     }
@@ -1807,7 +2678,45 @@ int ota_download_file(const char *url, const char *module, ota_data_cb data_cb)
         return OTA_DOWNLOAD_ERROR;
     }
 
+    if (response_code >= 400) {
+        fprintf(stderr, "[ERROR] OTA 下载失败：HTTP状态码=%ld\n", response_code);
+        return OTA_DOWNLOAD_ERROR;
+    }
+
     return OTA_DOWNLOAD_OK;
+}
+
+// ======================
+// 单文件流式下载
+// ======================
+int ota_download_file(const char *url, const char *module, ota_data_cb data_cb)
+{
+    OtaDownloadCtx ctx = {
+        .data_cb = data_cb,
+        .module = module,
+        .total_bytes = 0,
+        .downloaded_bytes = 0,
+        .file_start_bytes = 0,
+        .file_expected_size = 0,
+        .last_report_percent = -1,
+        .last_report_ms = 0,
+        .report_progress = 1,
+        .user_error = 0,
+        .hash_type = OTA_HASH_NONE
+    };
+
+    gw_ota_report_progress_percent(0, "开始下载", module);
+    ctx.last_report_percent = 0;
+    ctx.last_report_ms = ota_now_ms();
+    int ret = ota_download_file_internal(url, &ctx);
+    if (ret == OTA_DOWNLOAD_OK) {
+        gw_ota_report_progress_percent(100, "下载完成", module);
+    } else {
+        gw_ota_report_progress(ctx.user_error ? "-4" : "-2",
+                               ctx.user_error ? "固件数据处理失败" : "下载失败",
+                               module);
+    }
+    return ret;
 }
 
 // ======================
@@ -1817,22 +2726,72 @@ int ota_download_multi_files(cJSON *files, int file_cnt, const char *module,
                              ota_file_start_cb file_start_cb,
                              ota_data_cb data_cb)
 {
-    if (!files || file_cnt <= 0) return OTA_DOWNLOAD_ERROR;
+    if (!files || file_cnt <= 0 || !data_cb) return OTA_DOWNLOAD_ERROR;
+
+    curl_off_t total_size = 0;
+    for (int i = 0; i < file_cnt; i++) {
+        cJSON *f = cJSON_GetArrayItem(files, i);
+        total_size += ota_json_get_size(f, "size", "fileSize");
+    }
+
+    OtaDownloadCtx ctx = {
+        .data_cb = data_cb,
+        .module = module,
+        .total_bytes = total_size,
+        .downloaded_bytes = 0,
+        .file_start_bytes = 0,
+        .file_expected_size = 0,
+        .last_report_percent = -1,
+        .last_report_ms = 0,
+        .report_progress = total_size > 0,
+        .user_error = 0,
+        .hash_type = OTA_HASH_NONE
+    };
+
+    gw_ota_report_progress_percent(0, "开始下载", module);
+    ctx.last_report_percent = 0;
+    ctx.last_report_ms = ota_now_ms();
 
     for (int i = 0; i < file_cnt; i++) {
         cJSON *f = cJSON_GetArrayItem(files, i);
-        char *name = cJSON_GetStringValue(cJSON_GetObjectItem(f, "fileName"));
-        char *url  = cJSON_GetStringValue(cJSON_GetObjectItem(f, "fileUrl"));
+        const char *name = ota_json_get_string(f, "fileName", "name");
+        const char *url = ota_json_get_string(f, "url", "fileUrl");
+        const char *file_sign = ota_json_get_string(f, "sign", "fileSign");
+        const char *file_md5 = ota_json_get_string(f, "md5", "fileMd5");
+        curl_off_t file_size = ota_json_get_size(f, "size", "fileSize");
 
-        if (!name || !url) continue;
+        if (!url) {
+            gw_ota_report_progress("-2", "下载失败：缺少文件URL", module);
+            return OTA_DOWNLOAD_ERROR;
+        }
+        if (!name) {
+            name = "unknown";
+        }
 
         // 通知用户：新文件开始
         if (file_start_cb) file_start_cb(name, i+1, file_cnt);
 
         // 流式下载
-        if (ota_download_file(url, module, data_cb) != 0) {
+        ota_prepare_file_check(&ctx, NULL, file_sign, file_md5, file_size);
+        if (ota_download_file_internal(url, &ctx) != 0) {
+            gw_ota_report_progress(ctx.user_error ? "-4" : "-2",
+                                   ctx.user_error ? "固件数据处理失败" : "下载失败",
+                                   module);
+            return OTA_DOWNLOAD_ERROR;
+        }
+
+        if (ota_finish_file_check(&ctx) != 0) {
+            gw_ota_report_progress("-3", "固件校验失败", module);
+            return OTA_DOWNLOAD_ERROR;
+        }
+
+        if (g_user_ota_file_finish_cb &&
+            g_user_ota_file_finish_cb(name, i + 1, file_cnt) != 0) {
+            gw_ota_report_progress("-4", "固件烧录失败", module);
             return OTA_DOWNLOAD_ERROR;
         }
     }
+
+    gw_ota_report_progress_percent(100, "下载完成", module);
     return OTA_DOWNLOAD_OK;
 }

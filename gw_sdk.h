@@ -88,6 +88,7 @@ typedef int (*ota_data_cb)(const char *data, size_t len);
 
 // 多文件开始通知
 typedef void (*ota_file_start_cb)(const char *file_name, int index, int total);
+typedef int (*ota_file_finish_cb)(const char *file_name, int index, int total);
 
 /**
  * @brief 网关核心初始化函数
@@ -143,6 +144,7 @@ char *build_alink_payload(const char *raw_json);
  * @note 需确保subdev->connected=1，否则直接返回失败
  */
 int gw_publish_subdev(SubDevice *subdev, const char *payload);
+int gw_publish_subdev_by_name(const char *dn, const char *payload);
 
 // 动态增删路由
 /**
@@ -250,6 +252,9 @@ void iot_set_user_service_callback(user_service_cb_t cb);
 
 // 注册 OTA 回调
 void gw_register_ota_callback(ota_callback_t cb);
+void gw_register_ota_data_callback(ota_data_cb cb);
+void gw_register_ota_file_start_callback(ota_file_start_cb cb);
+void gw_register_ota_file_finish_callback(ota_file_finish_cb cb);
 
 /**
  * @brief 上报当前设备 OTA 版本到阿里云 IoT 平台
@@ -267,6 +272,7 @@ int gw_ota_report_version(const char *version, const char *module);
  * @return 0成功，-1失败
  */
 int gw_ota_report_progress(const char *step, const char *desc, const char *module);
+int gw_ota_report_progress_percent(int percent, const char *desc, const char *module);
 
 // ==============================
 //  单文件下载（流式）
