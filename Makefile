@@ -28,4 +28,3 @@ run: $(TARGET)
 	./$(TARGET)
 
 .PHONY: all clean run
-🔧 使用方法
