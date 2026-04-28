@@ -1,8 +1,16 @@
 #include "gw_sdk.h"
+#include <ctype.h>
 
 static Gateway g_gw;
 static RouteTable g_route;
 static char g_cfg_path[256];
+static user_service_cb_t g_user_service_cb = NULL;
+ota_callback_t g_user_ota_callback = NULL;
+
+typedef struct {
+    ota_data_cb data_cb;
+    int user_error;
+} OtaDownloadCtx;
 
 #define TIMESTAMP_VALUE             "2524608000000"
 #define MQTT_CLINETID_KV            "|timestamp=2524608000000,_v=paho-c-1.0.0,securemode=3,signmethod=hmacsha256,lan=C|"
@@ -640,6 +648,92 @@ static int gw_on_message(void *ctx, char *topic, int tlen, MQTTAsync_message *ms
     printf("=============================================\n\n");
     // ====================================================================
 
+    if (strstr(topic, "/ota/device/upgrade/") != NULL) {
+        printf("[OTA SDK] 收到阿里云 OTA 升级通知\n");
+
+        cJSON *root = cJSON_Parse(payload);
+        if (!root) {
+            fprintf(stderr, "[OTA SDK] JSON 解析失败\n");
+            goto exit_ota;
+        }
+
+        cJSON *data = cJSON_GetObjectItem(root, "data");
+        if (!data) {
+            fprintf(stderr, "[OTA SDK] 无 data 字段\n");
+            goto exit_ota;
+        }
+
+        // 通用字段
+        char *version    = cJSON_GetStringValue(cJSON_GetObjectItem(data, "version"));
+        char *module     = cJSON_GetStringValue(cJSON_GetObjectItem(data, "module"));
+        char *signMethod = cJSON_GetStringValue(cJSON_GetObjectItem(data, "signMethod"));
+        int   isDiff     = cJSON_GetNumberValue(cJSON_GetObjectItem(data, "isDiff"));
+
+        if (!version) version = "unknown";
+        if (!module) module = "default";
+        if (!signMethod) signMethod = "MD5";
+
+        printf("[OTA SDK] 版本: %s | 模块: %s | 差分包: %d\n", version, module, isDiff);
+
+        // ====================== 判断：单文件包 OR 多文件包 ======================
+        cJSON *files = cJSON_GetObjectItem(data, "files");
+
+        // -------------------- 单文件包 --------------------
+        if (!files) {
+            char *url     = cJSON_GetStringValue(cJSON_GetObjectItem(data, "url"));
+            char *sign    = cJSON_GetStringValue(cJSON_GetObjectItem(data, "sign"));
+            char *md5     = cJSON_GetStringValue(cJSON_GetObjectItem(data, "md5"));
+            int   size    = cJSON_GetNumberValue(cJSON_GetObjectItem(data, "size"));
+
+            printf("[OTA SDK] 类型: 单文件包\n");
+            printf("[OTA SDK] URL: %s\n", url ? url : "null");
+            printf("[OTA SDK] SIGN: %s\n", sign ? sign : "null");
+
+            // 用户回调：单文件
+            if (g_user_ota_callback != NULL) {
+                g_user_ota_callback(
+                    module,
+                    version,
+                    signMethod,
+                    isDiff,
+                    url,
+                    sign,
+                    md5,
+                    size,
+                    NULL,   // files 数组传 NULL
+                    0       // 文件数量 0
+                );
+            }
+        }
+        // -------------------- 多文件包 --------------------
+        else if (cJSON_IsArray(files)) {
+            int file_cnt = cJSON_GetArraySize(files);
+            printf("[OTA SDK] 类型: 多文件包 | 文件数量: %d\n", file_cnt);
+
+            // 把 files 数组原样传给用户（让用户自己遍历解析）
+            if (g_user_ota_callback != NULL) {
+                g_user_ota_callback(
+                    module,
+                    version,
+                    signMethod,
+                    isDiff,
+                    NULL,    // 单文件url传NULL
+                    NULL,
+                    NULL,
+                    0,
+                    files,  // 传递文件数组
+                    file_cnt
+                );
+            }
+        }
+
+        exit_ota:
+        if (root) cJSON_Delete(root);
+        MQTTAsync_freeMessage(&msg);
+        MQTTAsync_free(topic);
+        return 0;
+    }
+    
     // 2. 解析根节点
     cJSON *root = cJSON_Parse(payload);
     if (!root) {
@@ -1511,6 +1605,11 @@ void iot_set_user_service_callback(user_service_cb_t cb)
     g_user_service_cb = cb;
 }
 
+void gw_register_ota_callback(ota_callback_t cb)
+{
+    g_user_ota_callback = cb;
+}
+
 int gw_ota_report_version(const char *version, const char *module)
 {
     if (version == NULL || strlen(version) == 0) {
@@ -1648,9 +1747,16 @@ static int dl_progress(void *mod, curl_off_t total, curl_off_t now, curl_off_t, 
 static size_t dl_write_cb(void *data, size_t size, size_t nmemb, void *userp)
 {
     size_t real_len = size * nmemb;
-    ota_data_cb cb = (ota_data_cb)userp;
+    OtaDownloadCtx *ctx = (OtaDownloadCtx *)userp;
 
-    if (cb) cb((const char *)data, real_len);
+    if (!ctx || !ctx->data_cb) {
+        return real_len;
+    }
+
+    if (ctx->data_cb((const char *)data, real_len) != 0) {
+        ctx->user_error = 1;
+        return 0;
+    }
     return real_len;
 }
 
@@ -1659,8 +1765,18 @@ static size_t dl_write_cb(void *data, size_t size, size_t nmemb, void *userp)
 // ======================
 int ota_download_file(const char *url, const char *module, ota_data_cb data_cb)
 {
+    if (!url || strlen(url) == 0 || !data_cb) {
+        fprintf(stderr, "[ERROR] OTA 下载失败：url/data_cb 不能为空\n");
+        return OTA_DOWNLOAD_ERROR;
+    }
+
     CURL *curl = curl_easy_init();
     if (!curl) return OTA_DOWNLOAD_ERROR;
+
+    OtaDownloadCtx ctx = {
+        .data_cb = data_cb,
+        .user_error = 0
+    };
 
     curl_easy_setopt(curl, CURLOPT_URL, url);
     curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
@@ -1671,7 +1787,7 @@ int ota_download_file(const char *url, const char *module, ota_data_cb data_cb)
 
     // 流式回调
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, dl_write_cb);
-    curl_easy_setopt(curl, CURLOPT_WRITEDATA, (void *)data_cb);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &ctx);
 
     // 进度
     curl_easy_setopt(curl, CURLOPT_XFERINFOFUNCTION, dl_progress);
@@ -1681,7 +1797,17 @@ int ota_download_file(const char *url, const char *module, ota_data_cb data_cb)
     CURLcode ret = curl_easy_perform(curl);
     curl_easy_cleanup(curl);
 
-    return (ret == CURLE_OK) ? OTA_DOWNLOAD_OK : OTA_DOWNLOAD_ERROR;
+    if (ctx.user_error) {
+        fprintf(stderr, "[ERROR] OTA 下载中止：用户数据处理回调返回失败\n");
+        return OTA_DOWNLOAD_ERROR;
+    }
+
+    if (ret != CURLE_OK) {
+        fprintf(stderr, "[ERROR] OTA 下载失败：curl ret=%d\n", ret);
+        return OTA_DOWNLOAD_ERROR;
+    }
+
+    return OTA_DOWNLOAD_OK;
 }
 
 // ======================

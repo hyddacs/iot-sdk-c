@@ -66,7 +66,7 @@ typedef struct {
 // 新增：服务调用 自定义回调函数类型
 typedef int (*user_service_cb_t)(const char *topic, const char *method, const char *params_json);
 
-// OTA 回调
+// OTA 升级通知回调。SDK 只解析升级元信息，下载后的数据处理由用户回调完成。
 typedef void (*ota_callback_t)(
     char *module,
     char *version,
@@ -80,20 +80,15 @@ typedef void (*ota_callback_t)(
     int fileCount       // 文件数量
 );
 
-// ==============================
-//  用户数据接收回调（流式）
-//  会被调用多次，每次一段数据
-// ==============================
+// OTA 下载数据回调（流式）。
+// SDK 不保存文件；每次收到一段下载数据，就把缓冲区指针和长度交给用户处理。
+// data 只在回调期间有效，用户需要在回调内完成写 flash、写文件、校验或拷贝。
+// 返回 0 表示继续下载，返回非 0 表示用户处理失败并中止下载。
 typedef int (*ota_data_cb)(const char *data, size_t len);
 
 // 多文件开始通知
 typedef void (*ota_file_start_cb)(const char *file_name, int index, int total);
 
-extern ota_callback_t g_user_ota_callback;
-
-
-// 内部全局变量
-static user_service_cb_t g_user_service_cb = NULL;
 /**
  * @brief 网关核心初始化函数
  * @details 加载网关配置文件、初始化路由表读写锁、创建网关MQTT客户端、订阅下行主题、初始化子设备管理模块
@@ -272,21 +267,6 @@ int gw_ota_report_version(const char *version, const char *module);
  * @return 0成功，-1失败
  */
 int gw_ota_report_progress(const char *step, const char *desc, const char *module);
-
-// 下载数据会通过这个回调抛给用户
-// data: 内存块指针
-// len: 数据长度
-typedef int (*ota_data_recv_cb)(const char *data, size_t len);
-
-// ====================== 下载接口 ======================
-// 单文件下载 → 数据通过 cb 返回给用户
-int ota_download_file(const char *url, const char *module, ota_data_recv_cb cb);
-
-// 多文件下载 → 逐个文件抛给用户（文件名 + 数据回调）
-typedef void (*ota_file_begin_cb)(const char *file_name, int index, int total);
-int ota_download_multi_files(cJSON *files, int file_cnt, const char *module,
-                             ota_file_begin_cb file_begin_cb,
-                             ota_data_recv_cb data_cb);
 
 // ==============================
 //  单文件下载（流式）
