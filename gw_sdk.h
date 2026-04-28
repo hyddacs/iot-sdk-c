@@ -7,6 +7,7 @@
 #include <unistd.h>
 #include <pthread.h>
 #include <stdint.h>
+#include <curl/curl.h>
 #include "MQTTAsync.h"
 #include "cJSON.h"
 
@@ -16,6 +17,11 @@
 #define DEVICESECRET_MAXLEN     64
 #define SIGN_SOURCE_MAXLEN      256
 #define PASSWORD_MAXLEN         65
+
+// 下载结果
+#define OTA_DOWNLOAD_OK      0
+#define OTA_DOWNLOAD_ERROR  -1
+
 
 typedef enum {
     RULE_NUM,
@@ -59,6 +65,32 @@ typedef struct {
 
 // 新增：服务调用 自定义回调函数类型
 typedef int (*user_service_cb_t)(const char *topic, const char *method, const char *params_json);
+
+// OTA 回调
+typedef void (*ota_callback_t)(
+    char *module,
+    char *version,
+    char *signMethod,
+    int isDiff,
+    char *fileUrl,      // 单文件URL（多文件为NULL）
+    char *fileSign,
+    char *fileMd5,
+    int fileSize,
+    cJSON *files,       // 多文件数组（单文件为NULL）
+    int fileCount       // 文件数量
+);
+
+// ==============================
+//  用户数据接收回调（流式）
+//  会被调用多次，每次一段数据
+// ==============================
+typedef int (*ota_data_cb)(const char *data, size_t len);
+
+// 多文件开始通知
+typedef void (*ota_file_start_cb)(const char *file_name, int index, int total);
+
+extern ota_callback_t g_user_ota_callback;
+
 
 // 内部全局变量
 static user_service_cb_t g_user_service_cb = NULL;
@@ -220,4 +252,51 @@ int json_get_int(const char *json, const char *key, int *out);
 
 // 全局注册自定义服务回调，外部用户可调用
 void iot_set_user_service_callback(user_service_cb_t cb);
+
+// 注册 OTA 回调
+void gw_register_ota_callback(ota_callback_t cb);
+
+/**
+ * @brief 上报当前设备 OTA 版本到阿里云 IoT 平台
+ * @param version  当前固件版本号（必填，如 "1.0.0"）
+ * @param module   模块名（可选，传 NULL / 空串 则使用默认 "default"）
+ */
+int gw_ota_report_version(const char *version, const char *module);
+
+
+/**
+ * @brief  阿里云 OTA 升级进度上报（2024 最新官方格式）
+ * @param  step     字符串类型进度/错误码："10","50","100","-1","-2","-3","-4"。-1：升级失败。-2：下载失败。-3：校验失败。-4：烧写失败。
+ * @param  desc     状态描述文字，如 "升级中" "下载失败" "校验成功"
+ * @param  module   模块名，传 NULL 表示默认 default（可不上报）
+ * @return 0成功，-1失败
+ */
+int gw_ota_report_progress(const char *step, const char *desc, const char *module);
+
+// 下载数据会通过这个回调抛给用户
+// data: 内存块指针
+// len: 数据长度
+typedef int (*ota_data_recv_cb)(const char *data, size_t len);
+
+// ====================== 下载接口 ======================
+// 单文件下载 → 数据通过 cb 返回给用户
+int ota_download_file(const char *url, const char *module, ota_data_recv_cb cb);
+
+// 多文件下载 → 逐个文件抛给用户（文件名 + 数据回调）
+typedef void (*ota_file_begin_cb)(const char *file_name, int index, int total);
+int ota_download_multi_files(cJSON *files, int file_cnt, const char *module,
+                             ota_file_begin_cb file_begin_cb,
+                             ota_data_recv_cb data_cb);
+
+// ==============================
+//  单文件下载（流式）
+// ==============================
+int ota_download_file(const char *url, const char *module, ota_data_cb data_cb);
+
+// ==============================
+//  多文件下载（流式）
+// ==============================
+int ota_download_multi_files(cJSON *files, int file_cnt, const char *module,
+                             ota_file_start_cb file_start_cb,
+                             ota_data_cb data_cb);
 #endif

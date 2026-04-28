@@ -633,6 +633,12 @@ static int gw_on_message(void *ctx, char *topic, int tlen, MQTTAsync_message *ms
     strncpy(payload, msg->payload, len);
     payload[len] = '\0';
     printf("[down] 收到下行指令: %s\n", payload);
+    // ====================== 【你要的打印：接收数据】 ======================
+    printf("\n=============================================\n");
+    printf("[MQTT 接收] Topic: %s\n", topic);          // 打印主题
+    printf("[MQTT 接收] Payload: %s\n", payload);     // 打印原始数据
+    printf("=============================================\n\n");
+    // ====================================================================
 
     // 2. 解析根节点
     cJSON *root = cJSON_Parse(payload);
@@ -729,7 +735,7 @@ static int gw_on_message(void *ctx, char *topic, int tlen, MQTTAsync_message *ms
     free(params_json);
     MQTTAsync_freeMessage(&msg);
     MQTTAsync_free(topic);
-    return 1;
+    return 0;
 }
 
 //=====================================================================
@@ -963,6 +969,17 @@ int gw_init(const char *cfg_path) {
         // 不直接返回，订阅失败不影响核心功能
     } else {
         printf("[INFO] gw_init: 订阅下行主题成功, topic=%s\n", sub_topic);
+    }
+    char ota_sub_topic[256];
+    snprintf(ota_sub_topic, sizeof(ota_sub_topic), 
+         "/ota/device/upgrade/%s/%s", 
+         g_gw.pk, g_gw.dn);
+
+    ret = MQTTAsync_subscribe(g_gw.client, ota_sub_topic, 1, NULL);
+    if (ret != MQTTASYNC_SUCCESS) {
+        fprintf(stderr, "[ERROR] gw_init: 订阅OTA升级主题失败, ret=%d, topic=%s\n", ret, ota_sub_topic);
+    } else {
+        printf("[INFO] gw_init: 订阅OTA升级主题成功, topic=%s\n", ota_sub_topic);
     }
 
     // 11. 初始化子设备 + 错误打印
@@ -1492,4 +1509,204 @@ int gw_del_rule(const char *sub_pk, const char *sub_dn, const char *sub_ds) {
 void iot_set_user_service_callback(user_service_cb_t cb)
 {
     g_user_service_cb = cb;
+}
+
+int gw_ota_report_version(const char *version, const char *module)
+{
+    if (version == NULL || strlen(version) == 0) {
+        fprintf(stderr, "[ERROR] OTA 版本上报失败：version 不能为空\n");
+        return -1;
+    }
+
+    // 1. 构建阿里云 OTA 版本上报主题
+    char ota_report_topic[256];
+    snprintf(ota_report_topic, sizeof(ota_report_topic),
+             "/ota/device/inform/%s/%s",
+             g_gw.pk,
+             g_gw.dn);
+
+    // 2. 构建上报 JSON
+    cJSON *root = cJSON_CreateObject();
+    cJSON_AddNumberToObject(root, "id", 1);
+
+    cJSON *params = cJSON_CreateObject();
+    cJSON_AddStringToObject(params, "version", version);
+
+    // module 不传 → 使用 default
+    if (module == NULL || strlen(module) == 0) {
+        cJSON_AddStringToObject(params, "module", "default");
+    } else {
+        cJSON_AddStringToObject(params, "module", module);
+    }
+
+    cJSON_AddItemToObject(root, "params", params);
+
+    // 转成无格式 JSON 字符串
+    char *payload = cJSON_PrintUnformatted(root);
+    cJSON_Delete(root);
+
+    if (payload == NULL) {
+        fprintf(stderr, "[ERROR] OTA 上报：JSON 生成失败\n");
+        return -1;
+    }
+
+    // 3. MQTT 发布（QoS=1）
+    MQTTAsync_message pubmsg = MQTTAsync_message_initializer;
+    pubmsg.payload = payload;
+    pubmsg.payloadlen = strlen(payload);
+    pubmsg.qos = 1;
+    pubmsg.retained = 0;
+
+    int rc = MQTTAsync_sendMessage(g_gw.client, ota_report_topic, &pubmsg, NULL);
+
+    if (rc == MQTTASYNC_SUCCESS) {
+        printf("[INFO] OTA 版本上报成功！\n");
+        printf("       Topic: %s\n", ota_report_topic);
+        printf("       Payload: %s\n", payload);
+    } else {
+        fprintf(stderr, "[ERROR] OTA 版本上报失败，rc=%d\n", rc);
+    }
+
+    free(payload);
+    return rc;
+}
+
+/**
+ * @brief  阿里云 OTA 升级进度上报（2024 最新官方格式）
+ * @param  step     字符串类型进度/错误码："10","50","100","-1","-2","-3","-4"
+ * @param  desc     状态描述文字，如 "升级中" "下载失败" "校验成功"
+ * @param  module   模块名，传 NULL 表示默认 default（可不上报）
+ * @return 0成功，-1失败
+ */
+int gw_ota_report_progress(const char *step, const char *desc, const char *module)
+{
+    // 入参检查
+    if (step == NULL || desc == NULL) {
+        fprintf(stderr, "[ERROR] OTA 进度上报：step/desc 不能为空\n");
+        return -1;
+    }
+
+    // 构建阿里云 OTA 上报主题
+    char topic[256];
+    snprintf(topic, sizeof(topic),
+             "/ota/device/progress/%s/%s",
+             g_gw.pk, g_gw.dn);
+
+    // ===================== 2024 阿里云官方 JSON 格式 =====================
+    cJSON *root = cJSON_CreateObject();
+    cJSON_AddStringToObject(root, "id", "1");  // 官方要求：字符串类型数字
+
+    cJSON *params = cJSON_CreateObject();
+    cJSON_AddStringToObject(params, "step", step);
+    cJSON_AddStringToObject(params, "desc", desc);
+
+    // module == NULL 或空 → 不上报（官方允许）
+    if (module != NULL && strlen(module) > 0) {
+        cJSON_AddStringToObject(params, "module", module);
+    }
+
+    cJSON_AddItemToObject(root, "params", params);
+    char *payload = cJSON_PrintUnformatted(root);
+    cJSON_Delete(root);
+
+    if (!payload) {
+        fprintf(stderr, "[ERROR] OTA 进度上报：JSON 生成失败\n");
+        return -1;
+    }
+
+    // MQTT 发布
+    MQTTAsync_message msg = MQTTAsync_message_initializer;
+    msg.payload = payload;
+    msg.payloadlen = strlen(payload);
+    msg.qos = 1;
+
+    int rc = MQTTAsync_sendMessage(g_gw.client, topic, &msg, NULL);
+    if (rc == MQTTASYNC_SUCCESS) {
+        printf("[INFO] OTA 进度上报成功\n");
+        printf("       step: %s | desc: %s\n", step, desc);
+    } else {
+        fprintf(stderr, "[ERROR] OTA 进度上报失败, rc=%d\n", rc);
+    }
+
+    free(payload);
+    return rc;
+}
+
+// 进度上报（内部直接上报阿里云）
+static int dl_progress(void *mod, curl_off_t total, curl_off_t now, curl_off_t, curl_off_t)
+{
+    if (total <= 0) return 0;
+
+    int percent = (now * 100) / total;
+    char step[8];
+    snprintf(step, sizeof(step), "%d", percent);
+    gw_ota_report_progress(step, "下载中", (const char *)mod);
+    return 0;
+}
+
+// 真正的流式写回调 → 多次调用，每次一段数据
+static size_t dl_write_cb(void *data, size_t size, size_t nmemb, void *userp)
+{
+    size_t real_len = size * nmemb;
+    ota_data_cb cb = (ota_data_cb)userp;
+
+    if (cb) cb((const char *)data, real_len);
+    return real_len;
+}
+
+// ======================
+// 单文件流式下载
+// ======================
+int ota_download_file(const char *url, const char *module, ota_data_cb data_cb)
+{
+    CURL *curl = curl_easy_init();
+    if (!curl) return OTA_DOWNLOAD_ERROR;
+
+    curl_easy_setopt(curl, CURLOPT_URL, url);
+    curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
+    curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 0L);
+    curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 0L);
+    curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 15 * 60);
+
+    // 流式回调
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, dl_write_cb);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, (void *)data_cb);
+
+    // 进度
+    curl_easy_setopt(curl, CURLOPT_XFERINFOFUNCTION, dl_progress);
+    curl_easy_setopt(curl, CURLOPT_XFERINFODATA, (void *)module);
+    curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 0L);
+
+    CURLcode ret = curl_easy_perform(curl);
+    curl_easy_cleanup(curl);
+
+    return (ret == CURLE_OK) ? OTA_DOWNLOAD_OK : OTA_DOWNLOAD_ERROR;
+}
+
+// ======================
+// 多文件流式下载
+// ======================
+int ota_download_multi_files(cJSON *files, int file_cnt, const char *module,
+                             ota_file_start_cb file_start_cb,
+                             ota_data_cb data_cb)
+{
+    if (!files || file_cnt <= 0) return OTA_DOWNLOAD_ERROR;
+
+    for (int i = 0; i < file_cnt; i++) {
+        cJSON *f = cJSON_GetArrayItem(files, i);
+        char *name = cJSON_GetStringValue(cJSON_GetObjectItem(f, "fileName"));
+        char *url  = cJSON_GetStringValue(cJSON_GetObjectItem(f, "fileUrl"));
+
+        if (!name || !url) continue;
+
+        // 通知用户：新文件开始
+        if (file_start_cb) file_start_cb(name, i+1, file_cnt);
+
+        // 流式下载
+        if (ota_download_file(url, module, data_cb) != 0) {
+            return OTA_DOWNLOAD_ERROR;
+        }
+    }
+    return OTA_DOWNLOAD_OK;
 }
