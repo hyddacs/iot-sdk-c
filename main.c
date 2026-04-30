@@ -1,13 +1,9 @@
 #include "gw_sdk.h"
 #include <signal.h>
 
-// 置 1 后会在 main() 初始化完成后直接下载下面示例 URL。
-// 默认保持 0，避免设备启动时访问无效 URL；真实 OTA 流程由阿里云下发消息触发。
-#define ENABLE_OTA_DIRECT_DOWNLOAD_TEST 0
+static volatile sig_atomic_t running = 1;
 
-static int running = 1;
-
-// 下面 3 个变量只用于本示例：把 SDK 回调传来的 OTA 数据写入 /tmp 文件。
+// 下面 3 个变量只用于本示例：把 SDK 回调传来的 OTA 数据写入当前目录。
 // 实际网关设备上通常会替换为 flash 分区句柄、升级分区偏移、校验上下文等。
 static FILE *g_ota_file = NULL;
 static char g_ota_file_path[256] = {0};
@@ -61,8 +57,8 @@ static void app_ota_file_start(const char *file_name, int index, int total)
     close_current_ota_file();
     sanitize_file_name(file_name ? file_name : "ota.bin", safe_name, sizeof(safe_name));
 
-    // 示例保存到 /tmp，文件名前面带序号，便于区分多文件升级包中的每个文件。
-    snprintf(g_ota_file_path, sizeof(g_ota_file_path), "/tmp/ota_%02d_%s", index, safe_name);
+    // 示例保存到当前程序运行目录，文件名前面带序号，便于区分多文件升级包中的每个文件。
+    snprintf(g_ota_file_path, sizeof(g_ota_file_path), "./ota_%02d_%s", index, safe_name);
 
     g_ota_file = fopen(g_ota_file_path, "wb");
     if (!g_ota_file) {
@@ -122,8 +118,9 @@ static void app_ota_notify_handler(char *module, char *version, char *signMethod
            isDiff);
 
     if (fileUrl) {
-        // 单文件 OTA：fileUrl 有值，files 为 NULL。
-        printf("[APP OTA] 单文件: url=%s, size=%d, sign=%s, md5=%s\n",
+        // 单文件 OTA，或平台把“多文件升级包”打成一个 zip 后下发的场景：
+        // fileUrl/url 有值，files 为 NULL，SDK 会把该 URL 当成一个完整升级包下载。
+        printf("[APP OTA] 单个升级包文件: url=%s, size=%d, sign=%s, md5=%s\n",
                fileUrl,
                fileSize,
                fileSign ? fileSign : "",
@@ -170,43 +167,14 @@ static void register_ota_callbacks(void)
     gw_register_ota_data_callback(app_ota_data_handler);
 }
 
-#if ENABLE_OTA_DIRECT_DOWNLOAD_TEST
-static void run_ota_direct_download_examples(void)
-{
-    // 直连下载示例只用于理解接口，不模拟阿里云 MQTT 下发。
-    // 使用前请替换为真实可访问的固件 URL，并把 ENABLE_OTA_DIRECT_DOWNLOAD_TEST 改为 1。
-    const char *single_url = "https://example.com/firmware/gateway_v1.2.3.bin";
-    const char *multi_files_json =
-        "["
-        "{\"fileName\":\"app.bin\",\"fileUrl\":\"https://example.com/firmware/app.bin\",\"fileSize\":1048576},"
-        "{\"fileName\":\"config.bin\",\"fileUrl\":\"https://example.com/firmware/config.bin\",\"fileSize\":131072}"
-        "]";
-
-    printf("[APP OTA TEST] 单文件URL示例: %s\n", single_url);
-
-    // 直连测试不会经过 SDK 的 OTA 任务解析线程，所以这里手动调用 file_start/file_finish。
-    app_ota_file_start("gateway_v1.2.3.bin", 1, 1);
-    if (ota_download_file(single_url, "default", app_ota_data_handler) == OTA_DOWNLOAD_OK &&
-        app_ota_file_finish("gateway_v1.2.3.bin", 1, 1) == 0) {
-        gw_ota_report_version("1.2.3", "default");
-    }
-
-    cJSON *files = cJSON_Parse(multi_files_json);
-    if (files) {
-        // 多文件直连测试复用 SDK 的 ota_download_multi_files()。
-        // SDK 会按总 fileSize 计算总进度，并逐个触发 file_start/file_finish。
-        printf("[APP OTA TEST] 多文件URL示例: %s\n", multi_files_json);
-        if (ota_download_multi_files(files, cJSON_GetArraySize(files), "default",
-                                     app_ota_file_start, app_ota_data_handler) == OTA_DOWNLOAD_OK) {
-            gw_ota_report_version("1.2.3", "default");
-        }
-        cJSON_Delete(files);
-    }
-}
-#endif
-
 int main() {
     signal(SIGINT, sig_handle);
+
+    // 先注册 OTA 回调，再初始化网关。
+    // gw_init() 会订阅 OTA 主题；如果回调注册放在 gw_init() 后面，
+    // OTA 消息可能先到，导致 SDK 因缺少数据处理回调而上报失败。
+    register_ota_callbacks();
+
     //1. 配置文件初始化，包括配置文件读取、解析、创建路由规则、客户端创建、下行指令订阅
     //"gw_route.cfg"为项目文件夹下的配置文件
     if (gw_init("gw_route.cfg") != 0) {
@@ -214,63 +182,19 @@ int main() {
         return -1;
     }
 
-    // OTA测试：注册用户回调。真实OTA任务从阿里云下发后，SDK会单开线程执行下载。
-    register_ota_callbacks();
+    // 启动后先上报当前版本。平台看到当前版本为 1.0.0 后，才会判断是否需要下发 2.0.0 OTA任务。
+    gw_ota_report_version("5.0.0", "default");
 
-#if ENABLE_OTA_DIRECT_DOWNLOAD_TEST
-    // 本地直连下载测试：把上面的URL替换成真实OTA包地址，再将宏改为1。
-    run_ota_direct_download_examples();
-#endif
-
-    //2. 云平台测试下行指令
-    int ssss=0;
+    // 主线程必须保持运行，才能持续接收阿里云下发的 OTA 消息。
+    // 按 Ctrl+C 后会跳出循环，退出前再等待正在执行的 OTA 任务结束。
     while (running) {
-        printf("a");
-        //3， 模拟数据来源
-        const char *json ;
-        if(ssss%2==0)
-        {
-        json=
-        "{\"allowedTemp\":0.0,\"device_code\":\"123456789\","
-        "\"device_id\":\"40703436630002\",\"device_temp\":0.0,"
-        "\"device_time\":\"2025-05-16 10:46:22\",\"env_humi\":0.0,"
-        "\"env_tempe\":0.0,\"fault_alarm\":\"\",\"left1_dwell\":1.0,"
-        "\"left2_dwell\":0.0,\"operator_id\":\"ABCDE\","
-        "\"process_spec\":\"WPS 21-GXGL-01\",\"project_id\":\"ABCDE\","
-        "\"right1_dwell\":2.0,\"right2_dwell\":0.0,\"station_id\":\"0708\","
-        "\"swing1_freq\":10,\"swing1_width\":20.0,\"swing2_freq\":0,"
-        "\"swing2_width\":0.0,\"timestampSec\":1747392382,\"timestampUsec\":476425,"
-        "\"torch1_current\":249.66761779785156,\"torch1_switch\":1,"
-        "\"torch1_voltage\":30.939964294433594,\"torch2_current\":0.0,"
-        "\"torch2_switch\":0,\"torch2_voltage\":0.0,\"trackNameTorch1\":\"HW\","
-        "\"trackNameTorch2\":\"HW\",\"unit_id\":\"XG-JS-01\",\"weld_angle\":2.0,"
-        "\"weld_direction\":0,\"weld_joint\":\"XG-PIPECODE-001\","
-        "\"weld_layer\":\"HW\",\"weld_process\":\"weld_process\","
-        "\"weld_speed\":0.0,\"weld_temp\":0.0,\"wirefeed1_speed\":11.0,"
-        "\"wirefeed2_speed\":0.0}";
-        }
-        else
-        {
-            json=
-            "{\"RoomTemp\":1.0,\"uid\":\"aa\"}";
-        }
-        //4. 根据原始数据及路由规则获取设备名
-        const char *name = gw_route_match(json);
-        if (name) {
-            //5. 构建阿里云格式数据
-            char *alink = build_alink_payload(json);
-            //6. 根据设备名在SDK内部加锁查找并发送，避免动态删路由时拿到失效指针。
-            if (alink) {
-                gw_publish_subdev_by_name(name, alink);
-                free(alink);
-            }
-        }else
-        {
-            printf("未找到设备\n");
-        }
         sleep(1);
-        ++ssss;
     }
+    if (gw_ota_is_busy()) {
+        printf("[APP OTA] 检测到OTA任务仍在执行，等待完成后再退出...\n");
+        gw_ota_wait_complete(-1);
+    }
+
     close_current_ota_file();
     //8.销毁客户端，释放资源
     gw_destroy();

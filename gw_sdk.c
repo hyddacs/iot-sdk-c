@@ -13,12 +13,16 @@ static ota_file_start_cb g_user_ota_file_start_cb = NULL;
 static ota_file_finish_cb g_user_ota_file_finish_cb = NULL;
 static pthread_mutex_t g_ota_task_lock = PTHREAD_MUTEX_INITIALIZER;
 static int g_ota_task_running = 0;
+static int g_ota_version_reported = 0;
+static char *g_pending_ota_payload = NULL;
 
 #define TIMESTAMP_VALUE             "2524608000000"
 #define MQTT_CLINETID_KV            "|timestamp=2524608000000,_v=paho-c-1.0.0,securemode=3,signmethod=hmacsha256,lan=C|"
 #define SHA256_KEY_IOPAD_SIZE       64
 #define SHA256_DIGEST_SIZE          32
 #define OTA_PROGRESS_MIN_INTERVAL_MS 3000
+#define OTA_MQTT_BLOCK_SIZE         4096
+#define OTA_MQTT_REPLY_TIMEOUT_MS   10000
 
 enum {
     OTA_HASH_NONE = 0,
@@ -60,6 +64,31 @@ typedef struct {
     char *payload;
 } OtaTask;
 
+typedef struct {
+    unsigned char *data;
+    size_t len;
+    curl_off_t file_length;
+    int offset;
+    int size;
+} OtaMqttBlock;
+
+typedef struct {
+    char id[16];
+    int active;
+    int received;
+    int code;
+    char msg[128];
+    curl_off_t file_length;
+    int b_size;
+    int b_offset;
+    unsigned char *block;
+    size_t block_len;
+} OtaMqttReplyState;
+
+static pthread_mutex_t g_ota_mqtt_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t g_ota_mqtt_cond = PTHREAD_COND_INITIALIZER;
+static OtaMqttReplyState g_ota_mqtt_reply;
+
 static void utils_sha256_zeroize(void *v, uint32_t n);
 void utils_sha256_init(iot_sha256_context *ctx);
 void utils_sha256_free(iot_sha256_context *ctx);
@@ -70,8 +99,14 @@ void utils_sha256_finish(iot_sha256_context *ctx, uint8_t output[32]);
 void utils_sha256(const uint8_t *input, uint32_t ilen, uint8_t output[32]);
 static void utils_hmac_sha256(const uint8_t *msg, uint32_t msg_len, const uint8_t *key, uint32_t key_len, uint8_t output[32]);
 static int ota_start_task(const char *payload);
+static int ota_defer_if_version_not_reported(const char *payload);
+static char *ota_mark_version_reported_and_take_pending(void);
 static void *ota_task_thread(void *arg);
 static int ota_download_file_internal(const char *url, OtaDownloadCtx *ctx);
+static int ota_download_file_mqtt(int stream_id, int file_id, curl_off_t file_size, OtaDownloadCtx *ctx);
+static int ota_mqtt_request_block(int stream_id, int file_id, curl_off_t offset, int size, OtaMqttBlock *out);
+static int ota_handle_mqtt_download_reply(const void *payload, int payload_len);
+static size_t dl_write_cb(void *data, size_t size, size_t nmemb, void *userp);
 static int ota_report_progress_from_ctx(OtaDownloadCtx *ctx, const char *desc, int force);
 static const char *ota_json_get_string(cJSON *obj, const char *key1, const char *key2);
 static int ota_json_get_int(cJSON *obj, const char *key1, const char *key2);
@@ -79,10 +114,14 @@ static curl_off_t ota_json_get_size(cJSON *obj, const char *key1, const char *ke
 static long long ota_now_ms(void);
 static void gw_make_msg_id(char *buf, size_t len);
 static int ota_code_is_success(cJSON *root);
+static const char *ota_file_name_from_url(const char *url, const char *fallback);
 static int ota_prepare_file_check(OtaDownloadCtx *ctx, const char *sign_method,
                                   const char *file_sign, const char *file_md5,
                                   curl_off_t file_size);
 static int ota_finish_file_check(OtaDownloadCtx *ctx);
+static char *mqtt_topic_dup(const char *topic, int topic_len);
+static void log_payload_prefix_hex(const char *payload, int len);
+static uint16_t ota_crc16_ibm(const unsigned char *data, size_t len);
 static void utils_md5_init(iot_md5_context *ctx);
 static void utils_md5_starts(iot_md5_context *ctx);
 static void utils_md5_update(iot_md5_context *ctx, const unsigned char *input, uint32_t ilen);
@@ -731,6 +770,68 @@ int json_get_int(const char *json, const char *key, int *out) {
     return 0;
 }
 
+static const char *mqtt_connect_code_desc(int code)
+{
+    switch (code) {
+        case 1:
+            return "CONNACK: 协议版本不支持";
+        case 2:
+            return "CONNACK: ClientID不合法或被拒绝";
+        case 3:
+            return "CONNACK: 服务端不可用";
+        case 4:
+            return "CONNACK: 用户名或密码错误";
+        case 5:
+            return "CONNACK: 未授权，通常是ProductKey/DeviceName/DeviceSecret不匹配或设备状态异常";
+        case MQTTASYNC_FAILURE:
+            return "Paho: 通用失败";
+        case MQTTASYNC_PERSISTENCE_ERROR:
+            return "Paho: 持久化错误";
+        case MQTTASYNC_DISCONNECTED:
+            return "Paho: 客户端未连接或连接已断开";
+        case MQTTASYNC_MAX_MESSAGES_INFLIGHT:
+            return "Paho: inflight消息数量已达上限";
+        case MQTTASYNC_BAD_UTF8_STRING:
+            return "Paho: UTF-8字符串非法";
+        case MQTTASYNC_NULL_PARAMETER:
+            return "Paho: 参数为空";
+        case MQTTASYNC_TOPICNAME_TRUNCATED:
+            return "Paho: Topic被截断";
+        case MQTTASYNC_BAD_STRUCTURE:
+            return "Paho: 结构体初始化不正确";
+        case MQTTASYNC_BAD_QOS:
+            return "Paho: QoS非法";
+        case MQTTASYNC_NO_MORE_MSGIDS:
+            return "Paho: 消息ID耗尽";
+        case MQTTASYNC_OPERATION_INCOMPLETE:
+            return "Paho: 操作尚未完成";
+        case MQTTASYNC_MAX_BUFFERED_MESSAGES:
+            return "Paho: 缓冲消息数量已达上限";
+        default:
+            return "未知连接失败码，请结合Paho/服务端日志排查";
+    }
+}
+
+static void mqtt_connect_success(void *context, MQTTAsync_successData *response)
+{
+    const char *name = context ? (const char *)context : "unknown";
+    int token = response ? response->token : -1;
+
+    printf("[INFO] MQTT连接成功回调: device=%s, token=%d\n", name, token);
+}
+
+static void mqtt_connect_failure(void *context, MQTTAsync_failureData *response)
+{
+    const char *name = context ? (const char *)context : "unknown";
+    int code = response ? response->code : 0;
+    int token = response ? response->token : -1;
+    const char *message = (response && response->message) ? response->message : "";
+
+    fprintf(stderr,
+            "[ERROR] MQTT连接失败回调: device=%s, code=%d, token=%d, reason=%s, message=%s\n",
+            name, code, token, mqtt_connect_code_desc(code), message);
+}
+
 
 int subdev_init(SubDevice *subdev) {
     // 1. 入参校验 + 详细错误打印
@@ -766,7 +867,7 @@ int subdev_init(SubDevice *subdev) {
            subdev->dn, cid, user);
 
     // 5. 创建子设备MQTT客户端 + 错误打印
-    ret = MQTTAsync_create(&subdev->client, g_gw.broker, cid, 0, NULL);
+    ret = MQTTAsync_create(&subdev->client, g_gw.broker, cid, MQTTCLIENT_PERSISTENCE_NONE, NULL);
     if (ret != MQTTASYNC_SUCCESS) {
         fprintf(stderr, "[ERROR] subdev_init: 创建MQTT客户端失败 (dn=%s, broker=%s, ret=%d)\n", 
                 subdev->dn, g_gw.broker, ret);
@@ -781,6 +882,9 @@ int subdev_init(SubDevice *subdev) {
     opt.keepAliveInterval = 60;
     opt.cleansession = 1;    // 清理会话，避免重连时残留状态
     opt.retryInterval = 2;   // 重连间隔，增强鲁棒性
+    opt.context = subdev->dn;
+    opt.onSuccess = mqtt_connect_success;
+    opt.onFailure = mqtt_connect_failure;
 
     // 7. 发起MQTT连接 + 错误打印
     ret = MQTTAsync_connect(subdev->client, &opt);
@@ -972,6 +1076,40 @@ static int ota_code_is_success(cJSON *root)
     return 0;
 }
 
+static const char *ota_file_name_from_url(const char *url, const char *fallback)
+{
+    static __thread char name[128];
+    const char *start;
+    const char *end;
+    size_t len;
+
+    if (!fallback || strlen(fallback) == 0) {
+        fallback = "ota.bin";
+    }
+    if (!url || strlen(url) == 0) {
+        return fallback;
+    }
+
+    start = strrchr(url, '/');
+    start = start ? start + 1 : url;
+    end = start;
+    while (*end && *end != '?' && *end != '#') {
+        end++;
+    }
+
+    len = (size_t)(end - start);
+    if (len == 0) {
+        return fallback;
+    }
+    if (len >= sizeof(name)) {
+        len = sizeof(name) - 1;
+    }
+
+    memcpy(name, start, len);
+    name[len] = '\0';
+    return name;
+}
+
 static void ota_hex_encode_lower(const uint8_t *input, size_t input_len, char *output, size_t output_len)
 {
     static const char hex[] = "0123456789abcdef";
@@ -1091,6 +1229,150 @@ static int ota_finish_file_check(OtaDownloadCtx *ctx)
     return 0;
 }
 
+static char *mqtt_topic_dup(const char *topic, int topic_len)
+{
+    size_t len;
+    char *copy;
+
+    if (!topic) {
+        return NULL;
+    }
+
+    len = topic_len > 0 ? (size_t)topic_len : strlen(topic);
+    copy = malloc(len + 1);
+    if (!copy) {
+        return NULL;
+    }
+
+    memcpy(copy, topic, len);
+    copy[len] = '\0';
+    return copy;
+}
+
+static void log_payload_prefix_hex(const char *payload, int len)
+{
+    int dump_len = len < 16 ? len : 16;
+
+    if (!payload || len <= 0) {
+        return;
+    }
+
+    fprintf(stderr, "[ERROR] gw_on_message: payload前%d字节HEX:", dump_len);
+    for (int i = 0; i < dump_len; i++) {
+        fprintf(stderr, " %02X", (unsigned char)payload[i]);
+    }
+    fprintf(stderr, "\n");
+}
+
+static uint16_t ota_crc16_ibm(const unsigned char *data, size_t len)
+{
+    uint16_t crc = 0x0000;
+
+    for (size_t i = 0; i < len; i++) {
+        crc ^= data[i];
+        for (int bit = 0; bit < 8; bit++) {
+            if (crc & 0x0001) {
+                crc = (crc >> 1) ^ 0xA001;
+            } else {
+                crc >>= 1;
+            }
+        }
+    }
+
+    return crc;
+}
+
+static int ota_handle_mqtt_download_reply(const void *payload, int payload_len)
+{
+    const unsigned char *buf = (const unsigned char *)payload;
+    int json_len;
+    int block_len;
+    uint16_t crc_recv;
+    uint16_t crc_calc;
+    char *json_text = NULL;
+    cJSON *root = NULL;
+    cJSON *data = NULL;
+    const char *id = NULL;
+    const char *msg = NULL;
+    int code = -1;
+    int matched = 0;
+
+    if (!buf || payload_len < 4) {
+        fprintf(stderr, "[OTA MQTT] 下载响应长度非法: %d\n", payload_len);
+        return -1;
+    }
+
+    json_len = ((int)buf[0] << 8) | buf[1];
+    if (json_len <= 0 || payload_len < 2 + json_len + 2) {
+        fprintf(stderr, "[OTA MQTT] 下载响应JSON长度非法: json_len=%d, payload_len=%d\n",
+                json_len, payload_len);
+        return -1;
+    }
+
+    block_len = payload_len - 2 - json_len - 2;
+    crc_recv = (uint16_t)buf[payload_len - 2] | ((uint16_t)buf[payload_len - 1] << 8);
+    crc_calc = ota_crc16_ibm(buf + 2 + json_len, (size_t)block_len);
+    if (crc_recv != crc_calc) {
+        fprintf(stderr, "[OTA MQTT] 分片CRC校验失败: recv=0x%04X, calc=0x%04X\n",
+                crc_recv, crc_calc);
+        return -1;
+    }
+
+    json_text = malloc((size_t)json_len + 1);
+    if (!json_text) {
+        return -1;
+    }
+    memcpy(json_text, buf + 2, (size_t)json_len);
+    json_text[json_len] = '\0';
+
+    root = cJSON_Parse(json_text);
+    if (!root) {
+        fprintf(stderr, "[OTA MQTT] 下载响应JSON解析失败: %s\n", json_text);
+        free(json_text);
+        return -1;
+    }
+
+    id = ota_json_get_string(root, "id", NULL);
+    msg = ota_json_get_string(root, "msg", "message");
+    code = ota_json_get_int(root, "code", NULL);
+    data = cJSON_GetObjectItem(root, "data");
+
+    pthread_mutex_lock(&g_ota_mqtt_lock);
+    if (g_ota_mqtt_reply.active && id && strcmp(id, g_ota_mqtt_reply.id) == 0) {
+        free(g_ota_mqtt_reply.block);
+        g_ota_mqtt_reply.block = NULL;
+        g_ota_mqtt_reply.block_len = 0;
+        g_ota_mqtt_reply.code = code;
+        snprintf(g_ota_mqtt_reply.msg, sizeof(g_ota_mqtt_reply.msg), "%s", msg ? msg : "");
+
+        if (cJSON_IsObject(data)) {
+            g_ota_mqtt_reply.file_length = ota_json_get_size(data, "fileLength", NULL);
+            g_ota_mqtt_reply.b_size = ota_json_get_int(data, "bSize", NULL);
+            g_ota_mqtt_reply.b_offset = ota_json_get_int(data, "bOffset", NULL);
+        }
+
+        if (block_len > 0) {
+            g_ota_mqtt_reply.block = malloc((size_t)block_len);
+            if (g_ota_mqtt_reply.block) {
+                memcpy(g_ota_mqtt_reply.block, buf + 2 + json_len, (size_t)block_len);
+                g_ota_mqtt_reply.block_len = (size_t)block_len;
+            }
+        }
+        g_ota_mqtt_reply.received = 1;
+        matched = 1;
+        pthread_cond_signal(&g_ota_mqtt_cond);
+    }
+    pthread_mutex_unlock(&g_ota_mqtt_lock);
+
+    if (!matched) {
+        printf("[OTA MQTT] 忽略非当前请求的下载响应, id=%s\n", id ? id : "null");
+    }
+
+    cJSON_Delete(root);
+    free(json_text);
+    return matched ? 0 : -1;
+}
+
 static int ota_report_progress_from_ctx(OtaDownloadCtx *ctx, const char *desc, int force)
 {
     if (!ctx || !ctx->report_progress || ctx->total_bytes <= 0) {
@@ -1128,8 +1410,8 @@ static int ota_start_task(const char *payload)
     pthread_mutex_lock(&g_ota_task_lock);
     if (g_ota_task_running) {
         pthread_mutex_unlock(&g_ota_task_lock);
-        fprintf(stderr, "[OTA SDK] 已有OTA任务正在执行，拒绝新的OTA任务\n");
-        return -1;
+        fprintf(stderr, "[OTA SDK] 已有OTA任务正在执行，忽略重复OTA通知\n");
+        return 1;
     }
     g_ota_task_running = 1;
     pthread_mutex_unlock(&g_ota_task_lock);
@@ -1166,6 +1448,223 @@ static int ota_start_task(const char *payload)
 
     pthread_detach(tid);
     return 0;
+}
+
+static int ota_mqtt_request_block(int stream_id, int file_id, curl_off_t offset, int size, OtaMqttBlock *out)
+{
+    char id[16];
+    char topic[256];
+    cJSON *root = NULL;
+    cJSON *params = NULL;
+    cJSON *file_info = NULL;
+    cJSON *file_block = NULL;
+    char *payload = NULL;
+    int rc;
+    struct timespec ts;
+
+    if (!out || stream_id <= 0 || file_id <= 0 || offset < 0 || size <= 0) {
+        return OTA_DOWNLOAD_ERROR;
+    }
+    memset(out, 0, sizeof(*out));
+
+    gw_make_msg_id(id, sizeof(id));
+
+    pthread_mutex_lock(&g_ota_mqtt_lock);
+    free(g_ota_mqtt_reply.block);
+    memset(&g_ota_mqtt_reply, 0, sizeof(g_ota_mqtt_reply));
+    snprintf(g_ota_mqtt_reply.id, sizeof(g_ota_mqtt_reply.id), "%s", id);
+    g_ota_mqtt_reply.active = 1;
+    pthread_mutex_unlock(&g_ota_mqtt_lock);
+
+    root = cJSON_CreateObject();
+    params = cJSON_CreateObject();
+    file_info = cJSON_CreateObject();
+    file_block = cJSON_CreateObject();
+    if (!root || !params || !file_info || !file_block) {
+        cJSON_Delete(root);
+        cJSON_Delete(params);
+        cJSON_Delete(file_info);
+        cJSON_Delete(file_block);
+        return OTA_DOWNLOAD_ERROR;
+    }
+
+    cJSON_AddStringToObject(root, "id", id);
+    cJSON_AddStringToObject(root, "version", "1.0");
+    cJSON_AddNumberToObject(file_info, "streamId", stream_id);
+    cJSON_AddNumberToObject(file_info, "fileId", file_id);
+    cJSON_AddNumberToObject(file_block, "size", size);
+    cJSON_AddNumberToObject(file_block, "offset", (double)offset);
+    cJSON_AddItemToObject(params, "fileInfo", file_info);
+    cJSON_AddItemToObject(params, "fileBlock", file_block);
+    cJSON_AddItemToObject(root, "params", params);
+
+    payload = cJSON_PrintUnformatted(root);
+    cJSON_Delete(root);
+    if (!payload) {
+        return OTA_DOWNLOAD_ERROR;
+    }
+
+    snprintf(topic, sizeof(topic), "/sys/%s/%s/thing/file/download", g_gw.pk, g_gw.dn);
+    MQTTAsync_message msg = MQTTAsync_message_initializer;
+    msg.payload = payload;
+    msg.payloadlen = strlen(payload);
+    msg.qos = 1;
+    msg.retained = 0;
+
+    printf("[OTA MQTT] 请求分片: streamId=%d, fileId=%d, offset=%lld, size=%d\n",
+           stream_id, file_id, (long long)offset, size);
+    rc = MQTTAsync_sendMessage(g_gw.client, topic, &msg, NULL);
+    free(payload);
+    if (rc != MQTTASYNC_SUCCESS) {
+        fprintf(stderr, "[OTA MQTT] 分片请求发送失败, rc=%d\n", rc);
+        pthread_mutex_lock(&g_ota_mqtt_lock);
+        g_ota_mqtt_reply.active = 0;
+        pthread_mutex_unlock(&g_ota_mqtt_lock);
+        return OTA_DOWNLOAD_ERROR;
+    }
+
+    clock_gettime(CLOCK_REALTIME, &ts);
+    ts.tv_sec += OTA_MQTT_REPLY_TIMEOUT_MS / 1000;
+    ts.tv_nsec += (OTA_MQTT_REPLY_TIMEOUT_MS % 1000) * 1000000L;
+    if (ts.tv_nsec >= 1000000000L) {
+        ts.tv_sec++;
+        ts.tv_nsec -= 1000000000L;
+    }
+
+    pthread_mutex_lock(&g_ota_mqtt_lock);
+    while (!g_ota_mqtt_reply.received) {
+        rc = pthread_cond_timedwait(&g_ota_mqtt_cond, &g_ota_mqtt_lock, &ts);
+        if (rc == ETIMEDOUT) {
+            fprintf(stderr, "[OTA MQTT] 等待分片响应超时, id=%s\n", id);
+            g_ota_mqtt_reply.active = 0;
+            pthread_mutex_unlock(&g_ota_mqtt_lock);
+            return OTA_DOWNLOAD_ERROR;
+        }
+        if (rc != 0) {
+            fprintf(stderr, "[OTA MQTT] 等待分片响应失败, rc=%d\n", rc);
+            g_ota_mqtt_reply.active = 0;
+            pthread_mutex_unlock(&g_ota_mqtt_lock);
+            return OTA_DOWNLOAD_ERROR;
+        }
+    }
+
+    if (g_ota_mqtt_reply.code != 200) {
+        fprintf(stderr, "[OTA MQTT] 平台返回失败, code=%d, msg=%s\n",
+                g_ota_mqtt_reply.code, g_ota_mqtt_reply.msg);
+        g_ota_mqtt_reply.active = 0;
+        pthread_mutex_unlock(&g_ota_mqtt_lock);
+        return OTA_DOWNLOAD_ERROR;
+    }
+    if (g_ota_mqtt_reply.b_offset != (int)offset ||
+        g_ota_mqtt_reply.b_size != (int)g_ota_mqtt_reply.block_len) {
+        fprintf(stderr, "[OTA MQTT] 分片响应参数不匹配, req_offset=%lld, rsp_offset=%d, bSize=%d, block_len=%zu\n",
+                (long long)offset, g_ota_mqtt_reply.b_offset,
+                g_ota_mqtt_reply.b_size, g_ota_mqtt_reply.block_len);
+        g_ota_mqtt_reply.active = 0;
+        pthread_mutex_unlock(&g_ota_mqtt_lock);
+        return OTA_DOWNLOAD_ERROR;
+    }
+
+    out->data = g_ota_mqtt_reply.block;
+    out->len = g_ota_mqtt_reply.block_len;
+    out->file_length = g_ota_mqtt_reply.file_length;
+    out->offset = g_ota_mqtt_reply.b_offset;
+    out->size = g_ota_mqtt_reply.b_size;
+    g_ota_mqtt_reply.block = NULL;
+    g_ota_mqtt_reply.block_len = 0;
+    g_ota_mqtt_reply.active = 0;
+    pthread_mutex_unlock(&g_ota_mqtt_lock);
+
+    return OTA_DOWNLOAD_OK;
+}
+
+static int ota_download_file_mqtt(int stream_id, int file_id, curl_off_t file_size, OtaDownloadCtx *ctx)
+{
+    curl_off_t offset = 0;
+
+    if (stream_id <= 0 || file_id <= 0 || file_size <= 0 || !ctx || !ctx->data_cb) {
+        fprintf(stderr, "[OTA MQTT] 下载参数非法: streamId=%d, fileId=%d, size=%lld\n",
+                stream_id, file_id, (long long)file_size);
+        return OTA_DOWNLOAD_ERROR;
+    }
+
+    while (offset < file_size) {
+        curl_off_t remain = file_size - offset;
+        int req_size = remain > OTA_MQTT_BLOCK_SIZE ? OTA_MQTT_BLOCK_SIZE : (int)remain;
+        OtaMqttBlock block;
+
+        if (ota_mqtt_request_block(stream_id, file_id, offset, req_size, &block) != OTA_DOWNLOAD_OK) {
+            return OTA_DOWNLOAD_ERROR;
+        }
+        if (!block.data || block.len == 0) {
+            free(block.data);
+            fprintf(stderr, "[OTA MQTT] 收到空分片\n");
+            return OTA_DOWNLOAD_ERROR;
+        }
+        if (block.file_length > 0 && block.file_length != file_size) {
+            free(block.data);
+            fprintf(stderr, "[OTA MQTT] 文件总大小不一致: notify=%lld, reply=%lld\n",
+                    (long long)file_size, (long long)block.file_length);
+            return OTA_DOWNLOAD_ERROR;
+        }
+        if (dl_write_cb(block.data, 1, block.len, ctx) != block.len) {
+            free(block.data);
+            fprintf(stderr, "[OTA MQTT] 用户数据处理失败\n");
+            return OTA_DOWNLOAD_ERROR;
+        }
+
+        offset += (curl_off_t)block.len;
+        free(block.data);
+    }
+
+    return OTA_DOWNLOAD_OK;
+}
+
+static int ota_defer_if_version_not_reported(const char *payload)
+{
+    char *copy = NULL;
+
+    if (!payload) {
+        return -1;
+    }
+
+    pthread_mutex_lock(&g_ota_task_lock);
+    if (g_ota_version_reported) {
+        pthread_mutex_unlock(&g_ota_task_lock);
+        return 0;
+    }
+    pthread_mutex_unlock(&g_ota_task_lock);
+
+    copy = malloc(strlen(payload) + 1);
+    if (!copy) {
+        return -1;
+    }
+    strcpy(copy, payload);
+
+    pthread_mutex_lock(&g_ota_task_lock);
+    if (g_ota_version_reported) {
+        pthread_mutex_unlock(&g_ota_task_lock);
+        free(copy);
+        return 0;
+    }
+
+    free(g_pending_ota_payload);
+    g_pending_ota_payload = copy;
+    pthread_mutex_unlock(&g_ota_task_lock);
+    return 1;
+}
+
+static char *ota_mark_version_reported_and_take_pending(void)
+{
+    char *pending;
+
+    pthread_mutex_lock(&g_ota_task_lock);
+    g_ota_version_reported = 1;
+    pending = g_pending_ota_payload;
+    g_pending_ota_payload = NULL;
+    pthread_mutex_unlock(&g_ota_task_lock);
+
+    return pending;
 }
 
 static void *ota_task_thread(void *arg)
@@ -1264,16 +1763,11 @@ static void *ota_task_thread(void *arg)
             const char *file_sign = ota_json_get_string(file, "sign", "fileSign");
             const char *file_md5 = ota_json_get_string(file, "md5", "fileMd5");
             const char *dprotocol = ota_json_get_string(file, "dProtocol", NULL);
+            int stream_id = ota_json_get_int(file, "streamId", NULL);
+            int stream_file_id = ota_json_get_int(file, "streamFileId", "fileId");
             curl_off_t file_size = ota_json_get_size(file, "size", "fileSize");
 
-            if (dprotocol && ota_ascii_equal(dprotocol, "mqtt")) {
-                fprintf(stderr, "[OTA SDK] 当前版本不支持MQTT协议OTA下载\n");
-                gw_ota_report_progress("-2", "下载失败：不支持MQTT下载协议", module);
-                ret = OTA_DOWNLOAD_ERROR;
-                goto cleanup;
-            }
-
-            if (!file_url) {
+            if (!(dprotocol && ota_ascii_equal(dprotocol, "mqtt")) && !file_url) {
                 fprintf(stderr, "[OTA SDK] 多文件OTA缺少fileUrl/url字段\n");
                 gw_ota_report_progress("-2", "下载失败：缺少文件URL", module);
                 ret = OTA_DOWNLOAD_ERROR;
@@ -1281,14 +1775,18 @@ static void *ota_task_thread(void *arg)
             }
 
             if (!file_name) {
-                file_name = "unknown";
+                file_name = file_url ? ota_file_name_from_url(file_url, "ota.bin") : "mqtt_ota.bin";
             }
             if (g_user_ota_file_start_cb) {
                 g_user_ota_file_start_cb(file_name, i + 1, file_cnt);
             }
 
             ota_prepare_file_check(&dl_ctx, sign_method, file_sign, file_md5, file_size);
-            ret = ota_download_file_internal(file_url, &dl_ctx);
+            if (dprotocol && ota_ascii_equal(dprotocol, "mqtt")) {
+                ret = ota_download_file_mqtt(stream_id, stream_file_id, file_size, &dl_ctx);
+            } else {
+                ret = ota_download_file_internal(file_url, &dl_ctx);
+            }
             if (ret != OTA_DOWNLOAD_OK) {
                 gw_ota_report_progress(dl_ctx.user_error ? "-4" : "-2",
                                        dl_ctx.user_error ? "固件数据处理失败" : "下载失败",
@@ -1317,27 +1815,28 @@ static void *ota_task_thread(void *arg)
         curl_off_t size = ota_json_get_size(data, "size", "fileSize");
         const char *file_name = ota_json_get_string(data, "fileName", "name");
         const char *dprotocol = ota_json_get_string(data, "dProtocol", NULL);
+        int stream_id = ota_json_get_int(data, "streamId", NULL);
+        int stream_file_id = ota_json_get_int(data, "streamFileId", "fileId");
+        const char *download_name = NULL;
 
-        if (dprotocol && ota_ascii_equal(dprotocol, "mqtt")) {
-            fprintf(stderr, "[OTA SDK] 当前版本不支持MQTT协议OTA下载\n");
-            gw_ota_report_progress("-2", "下载失败：不支持MQTT下载协议", module);
-            goto cleanup;
-        }
-
-        if (!url) {
+        if (!(dprotocol && ota_ascii_equal(dprotocol, "mqtt")) && !url) {
             fprintf(stderr, "[OTA SDK] 单文件OTA缺少url/fileUrl字段\n");
             gw_ota_report_progress("-2", "下载失败：缺少文件URL", module);
             goto cleanup;
         }
+        download_name = file_name ? file_name :
+                        (url ? ota_file_name_from_url(url, "ota.bin") : "mqtt_ota.bin");
 
         if (g_user_ota_callback) {
             g_user_ota_callback((char *)module, (char *)version, (char *)sign_method,
-                                is_diff, (char *)url, (char *)sign, (char *)md5,
+                                is_diff,
+                                (char *)(url ? url : "mqtt://ota-stream"),
+                                (char *)sign, (char *)md5,
                                 size > INT32_MAX ? INT32_MAX : (int)size, NULL, 0);
         }
 
         if (g_user_ota_file_start_cb) {
-            g_user_ota_file_start_cb(file_name ? file_name : "default", 1, 1);
+            g_user_ota_file_start_cb(download_name, 1, 1);
         }
 
         OtaDownloadCtx dl_ctx = {
@@ -1358,14 +1857,18 @@ static void *ota_task_thread(void *arg)
         dl_ctx.last_report_percent = 0;
         dl_ctx.last_report_ms = ota_now_ms();
         ota_prepare_file_check(&dl_ctx, sign_method, sign, md5, size);
-        ret = ota_download_file_internal(url, &dl_ctx);
+        if (dprotocol && ota_ascii_equal(dprotocol, "mqtt")) {
+            ret = ota_download_file_mqtt(stream_id, stream_file_id, size, &dl_ctx);
+        } else {
+            ret = ota_download_file_internal(url, &dl_ctx);
+        }
         if (ret == OTA_DOWNLOAD_OK) {
             if (ota_finish_file_check(&dl_ctx) != 0) {
                 gw_ota_report_progress("-3", "固件校验失败", module);
                 goto cleanup;
             }
             if (g_user_ota_file_finish_cb &&
-                g_user_ota_file_finish_cb(file_name ? file_name : "default", 1, 1) != 0) {
+                g_user_ota_file_finish_cb(download_name, 1, 1) != 0) {
                 gw_ota_report_progress("-4", "固件烧录失败", module);
                 goto cleanup;
             }
@@ -1397,9 +1900,29 @@ cleanup:
 //=====================================================================
 static int gw_on_message(void *ctx, char *topic, int tlen, MQTTAsync_message *msg) {
     // 1. 安全读取 payload，防止越界
+    char *topic_copy = mqtt_topic_dup(topic, tlen);
+    if (!topic_copy) {
+        fprintf(stderr, "[ERROR] gw_on_message: topic内存分配失败\n");
+        MQTTAsync_freeMessage(&msg);
+        MQTTAsync_free(topic);
+        return 1;
+    }
+
+    char file_download_reply_topic[256];
+    snprintf(file_download_reply_topic, sizeof(file_download_reply_topic),
+             "/sys/%s/%s/thing/file/download_reply", g_gw.pk, g_gw.dn);
+    if (strcmp(topic_copy, file_download_reply_topic) == 0) {
+        ota_handle_mqtt_download_reply(msg->payload, msg->payloadlen);
+        free(topic_copy);
+        MQTTAsync_freeMessage(&msg);
+        MQTTAsync_free(topic);
+        return 1;
+    }
+
     char *payload = malloc(msg->payloadlen + 1);
     if (!payload) {
         fprintf(stderr, "[ERROR] gw_on_message: payload内存分配失败\n");
+        free(topic_copy);
         MQTTAsync_freeMessage(&msg);
         MQTTAsync_free(topic);
         return 1;
@@ -1407,31 +1930,57 @@ static int gw_on_message(void *ctx, char *topic, int tlen, MQTTAsync_message *ms
     int len = msg->payloadlen;
     memcpy(payload, msg->payload, len);
     payload[len] = '\0';
-#define GW_FREE_MESSAGE() do { free(payload); MQTTAsync_freeMessage(&msg); MQTTAsync_free(topic); } while (0)
+#define GW_FREE_MESSAGE() do { free(payload); free(topic_copy); MQTTAsync_freeMessage(&msg); MQTTAsync_free(topic); } while (0)
     printf("[down] 收到下行指令: %s\n", payload);
     // ====================== 【你要的打印：接收数据】 ======================
     printf("\n=============================================\n");
-    printf("[MQTT 接收] Topic: %s\n", topic);          // 打印主题
+    printf("[MQTT 接收] Topic: %s\n", topic_copy);     // 打印主题
     printf("[MQTT 接收] Payload: %s\n", payload);     // 打印原始数据
     printf("=============================================\n\n");
     // ====================================================================
 
-    if (strstr(topic, "/ota/device/upgrade/") != NULL) {
+    char property_set_topic[256];
+    snprintf(property_set_topic, sizeof(property_set_topic),
+             "/sys/%s/%s/thing/service/property/set", g_gw.pk, g_gw.dn);
+
+    if (strstr(topic_copy, "/ota/device/upgrade/") != NULL) {
+        int defer_ret = ota_defer_if_version_not_reported(payload);
+        if (defer_ret > 0) {
+            printf("[OTA SDK] 收到OTA通知，但当前版本尚未首次上报，先缓存任务，暂不启动OTA线程\n");
+            GW_FREE_MESSAGE();
+            return 1;
+        }
+        if (defer_ret < 0) {
+            fprintf(stderr, "[OTA SDK] 缓存OTA任务失败，丢弃本次OTA通知\n");
+            GW_FREE_MESSAGE();
+            return 1;
+        }
+
         printf("[OTA SDK] 收到阿里云 OTA 升级通知，创建OTA任务线程\n");
-        if (ota_start_task(payload) != 0) {
+        int start_ret = ota_start_task(payload);
+        if (start_ret < 0) {
             fprintf(stderr, "[OTA SDK] 创建OTA任务线程失败\n");
             gw_ota_report_progress("-1", "创建OTA任务线程失败", NULL);
+        } else if (start_ret > 0) {
+            printf("[OTA SDK] OTA任务已在执行，本次重复通知已确认并忽略\n");
         }
         GW_FREE_MESSAGE();
-        return 0;
+        return 1;
+    }
+
+    if (strcmp(topic_copy, property_set_topic) != 0) {
+        printf("[WARN] gw_on_message: 忽略非SDK订阅业务主题, topic=%s\n", topic_copy);
+        GW_FREE_MESSAGE();
+        return 1;
     }
     
     // 2. 解析根节点
     cJSON *root = cJSON_Parse(payload);
     if (!root) {
         const char *error_info = cJSON_GetErrorPtr();
-        fprintf(stderr, "[ERROR] gw_on_message: 解析下行指令JSON失败, 错误位置: %s\n", 
-                error_info ? error_info : "未知位置");
+        fprintf(stderr, "[ERROR] gw_on_message: 解析下行指令JSON失败, topic=%s, payloadlen=%d, 错误位置: %s\n",
+                topic_copy, len, error_info ? error_info : "未知位置");
+        log_payload_prefix_hex(payload, len);
         GW_FREE_MESSAGE();
         return 1;
     }
@@ -1457,14 +2006,14 @@ static int gw_on_message(void *ctx, char *topic, int tlen, MQTTAsync_message *ms
     // 优先执行 用户自定义处理逻辑
     if (g_user_service_cb != NULL)
     {
-        int user_ret = g_user_service_cb(topic, method, params_json ? params_json : "{}");
+        int user_ret = g_user_service_cb(topic_copy, method, params_json ? params_json : "{}");
         if (user_ret == 0)
         {
             // 自定义拦截，直接释放资源退出
             if(params_json) free(params_json);
             cJSON_Delete(root);
             GW_FREE_MESSAGE();
-            return 0;
+            return 1;
         }
     }
     // ========================================================================
@@ -1592,7 +2141,7 @@ static int gw_on_message(void *ctx, char *topic, int tlen, MQTTAsync_message *ms
     free(params_json); // 释放 cJSON_PrintUnformatted 生成的字符串
     GW_FREE_MESSAGE();
 #undef GW_FREE_MESSAGE
-    return 0;
+    return 1;
 }
 
 //=====================================================================
@@ -1766,7 +2315,8 @@ int gw_init(const char *cfg_path) {
             
             g_route.count++;
             route_rule_count++;
-            printf("[INFO] gw_init: 加载子设备信息, pk=%s, dn=%s\n", r->subdev.pk, r->subdev.dn);
+            printf("[INFO] gw_init: 加载子设备三元组, pk=%s, dn=%s, ds=%s\n",
+                   r->subdev.pk, r->subdev.dn, r->subdev.ds);
         }
     }
     fclose(f);
@@ -1792,7 +2342,7 @@ int gw_init(const char *cfg_path) {
     printf("[INFO] gw_init: MQTT签名成功, clientId=%s, username=%s\n", cid, user);
 
     // 7. 创建网关MQTT客户端 + 错误打印
-    ret = MQTTAsync_create(&g_gw.client, g_gw.broker, cid, 0, NULL);
+    ret = MQTTAsync_create(&g_gw.client, g_gw.broker, cid, MQTTCLIENT_PERSISTENCE_NONE, NULL);
     if (ret != MQTTASYNC_SUCCESS) {
         fprintf(stderr, "[ERROR] gw_init: 创建网关MQTT客户端失败, ret=%d\n", ret);
         pthread_rwlock_destroy(&g_route.lock);
@@ -1816,6 +2366,9 @@ int gw_init(const char *cfg_path) {
     opt.password = pwd; 
     opt.keepAliveInterval = 60;
     opt.cleansession = 1;
+    opt.context = (void *)"gateway";
+    opt.onSuccess = mqtt_connect_success;
+    opt.onFailure = mqtt_connect_failure;
 
     ret = MQTTAsync_connect(g_gw.client, &opt);
     if (ret != MQTTASYNC_SUCCESS) {
@@ -1862,6 +2415,18 @@ int gw_init(const char *cfg_path) {
         printf("[INFO] gw_init: 订阅OTA升级主题成功, topic=%s\n", ota_sub_topic);
     }
 
+    char file_download_reply_topic[256];
+    snprintf(file_download_reply_topic, sizeof(file_download_reply_topic),
+             "/sys/%s/%s/thing/file/download_reply", g_gw.pk, g_gw.dn);
+    ret = MQTTAsync_subscribe(g_gw.client, file_download_reply_topic, 1, NULL);
+    if (ret != MQTTASYNC_SUCCESS) {
+        fprintf(stderr, "[ERROR] gw_init: 订阅MQTT文件下载响应主题失败, ret=%d, topic=%s\n",
+                ret, file_download_reply_topic);
+    } else {
+        printf("[INFO] gw_init: 订阅MQTT文件下载响应主题成功, topic=%s\n",
+               file_download_reply_topic);
+    }
+
     // 11. 初始化子设备 + 错误打印
     pthread_rwlock_wrlock(&g_route.lock);
     int subdev_init_success = 0;
@@ -1885,6 +2450,11 @@ int gw_init(const char *cfg_path) {
 
 void gw_destroy(void) {
     printf("[INFO] gw_destroy: 开始销毁网关资源...\n");
+
+    pthread_mutex_lock(&g_ota_task_lock);
+    free(g_pending_ota_payload);
+    g_pending_ota_payload = NULL;
+    pthread_mutex_unlock(&g_ota_task_lock);
 
     // 1. 加读写锁（写锁） + 错误日志
     int ret = pthread_rwlock_wrlock(&g_route.lock);
@@ -1979,7 +2549,7 @@ const char *gw_route_match(const char *json) {
         return NULL;
     }
     matched_dn[0] = '\0';
-    printf("[INFO] gw_route_match: 开始匹配路由规则 (json=%s)\n", json);
+    printf("[INFO] gw_route_match: 开始匹配路由规则 \n");
 
     // 2. 解析JSON根节点 + 错误日志
     cJSON *root = cJSON_Parse(json);
@@ -2203,8 +2773,8 @@ int gw_publish_subdev(SubDevice *subdev, const char *payload) {
     msg.payload = (void *)payload;
     msg.payloadlen = strlen(payload);
     msg.qos = 1; // QoS1 确保消息送达
-    printf("[INFO] gw_publish_subdev: 准备上报消息 (dn=%s, payload=%s, payload长度=%d)\n",
-           subdev->dn, payload, msg.payloadlen);
+    printf("[INFO] gw_publish_subdev: 准备上报消息 (dn=%s, payload长度=%d)\n",
+           subdev->dn, msg.payloadlen);
 
     // 6. 发送MQTT消息 + 错误日志
     int ret = MQTTAsync_sendMessage(subdev->client, topic, &msg, NULL);
@@ -2456,8 +3026,36 @@ void gw_register_ota_file_finish_callback(ota_file_finish_cb cb)
     g_user_ota_file_finish_cb = cb;
 }
 
+int gw_ota_is_busy(void)
+{
+    int busy;
+
+    pthread_mutex_lock(&g_ota_task_lock);
+    busy = g_ota_task_running;
+    pthread_mutex_unlock(&g_ota_task_lock);
+
+    return busy;
+}
+
+int gw_ota_wait_complete(int timeout_ms)
+{
+    int elapsed_ms = 0;
+
+    while (gw_ota_is_busy()) {
+        if (timeout_ms >= 0 && elapsed_ms >= timeout_ms) {
+            return -1;
+        }
+        usleep(100 * 1000);
+        elapsed_ms += 100;
+    }
+
+    return 0;
+}
+
 int gw_ota_report_version(const char *version, const char *module)
 {
+    char *pending_ota_payload = NULL;
+
     if (version == NULL || strlen(version) == 0) {
         fprintf(stderr, "[ERROR] OTA 版本上报失败：version 不能为空\n");
         return -1;
@@ -2511,11 +3109,22 @@ int gw_ota_report_version(const char *version, const char *module)
         printf("[INFO] OTA 版本上报成功！\n");
         printf("       Topic: %s\n", ota_report_topic);
         printf("       Payload: %s\n", payload);
+        pending_ota_payload = ota_mark_version_reported_and_take_pending();
     } else {
         fprintf(stderr, "[ERROR] OTA 版本上报失败，rc=%d\n", rc);
     }
 
     free(payload);
+
+    if (pending_ota_payload) {
+        printf("[OTA SDK] 首次版本上报完成，开始处理此前缓存的OTA任务\n");
+        if (ota_start_task(pending_ota_payload) < 0) {
+            fprintf(stderr, "[OTA SDK] 启动缓存OTA任务失败\n");
+            gw_ota_report_progress("-1", "启动缓存OTA任务失败", module);
+        }
+        free(pending_ota_payload);
+    }
+
     return rc;
 }
 
@@ -2647,11 +3256,16 @@ static int ota_download_file_internal(const char *url, OtaDownloadCtx *ctx)
     CURL *curl = curl_easy_init();
     if (!curl) return OTA_DOWNLOAD_ERROR;
 
+    char curl_error[CURL_ERROR_SIZE] = {0};
+
     curl_easy_setopt(curl, CURLOPT_URL, url);
+    curl_easy_setopt(curl, CURLOPT_ERRORBUFFER, curl_error);
+    curl_easy_setopt(curl, CURLOPT_PROXY, "");
     curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
     curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 1L);
     curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 2L);
     curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
+    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 30L);
     curl_easy_setopt(curl, CURLOPT_TIMEOUT, 15 * 60);
 
     // 流式回调
@@ -2674,7 +3288,8 @@ static int ota_download_file_internal(const char *url, OtaDownloadCtx *ctx)
     }
 
     if (ret != CURLE_OK) {
-        fprintf(stderr, "[ERROR] OTA 下载失败：curl ret=%d\n", ret);
+        fprintf(stderr, "[ERROR] OTA 下载失败：curl ret=%d, error=%s\n",
+                ret, curl_error[0] ? curl_error : curl_easy_strerror(ret));
         return OTA_DOWNLOAD_ERROR;
     }
 

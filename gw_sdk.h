@@ -262,6 +262,8 @@ void gw_register_ota_file_finish_callback(ota_file_finish_cb cb);
  * @param module   模块名（可选，传 NULL / 空串 则使用默认 "default"）
  */
 int gw_ota_report_version(const char *version, const char *module);
+int gw_ota_is_busy(void);
+int gw_ota_wait_complete(int timeout_ms);
 
 
 /**
