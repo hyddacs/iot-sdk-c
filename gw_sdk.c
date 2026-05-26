@@ -65,6 +65,28 @@ typedef struct {
 } OtaTask;
 
 typedef struct {
+    RuleType type;
+    char key[32];
+    char val[64];
+    char sub_pk[PRODUCTKEY_MAXLEN];
+    char sub_dn[DEVICENAME_MAXLEN];
+    char sub_ds[DEVICESECRET_MAXLEN];
+} RouteAddTask;
+
+typedef struct {
+    char sub_pk[PRODUCTKEY_MAXLEN];
+    char sub_dn[DEVICENAME_MAXLEN];
+    char sub_ds[DEVICESECRET_MAXLEN];
+} RouteDelTask;
+
+typedef struct {
+    user_service_cb_t cb;
+    char *topic;
+    char method[64];
+    char *params_json;
+} UserServiceTask;
+
+typedef struct {
     unsigned char *data;
     size_t len;
     curl_off_t file_length;
@@ -120,6 +142,16 @@ static int ota_prepare_file_check(OtaDownloadCtx *ctx, const char *sign_method,
                                   curl_off_t file_size);
 static int ota_finish_file_check(OtaDownloadCtx *ctx);
 static char *mqtt_topic_dup(const char *topic, int topic_len);
+static void mqtt_connection_lost(void *context, char *cause);
+static int mqtt_ignore_message(void *ctx, char *topic, int tlen, MQTTAsync_message *msg);
+static int gw_subscribe_checked(const char *label, const char *topic, int qos);
+static void *gw_add_rule_task_thread(void *arg);
+static int gw_add_rule_async(RuleType type, const char *key, const char *val,
+                             const char *sub_pk, const char *sub_dn, const char *sub_ds);
+static void *gw_del_rule_task_thread(void *arg);
+static int gw_del_rule_async(const char *sub_pk, const char *sub_dn, const char *sub_ds);
+static void *user_service_task_thread(void *arg);
+static int user_service_dispatch_async(const char *topic, const char *method, const char *params_json);
 static void log_payload_prefix_hex(const char *payload, int len);
 static uint16_t ota_crc16_ibm(const unsigned char *data, size_t len);
 static void utils_md5_init(iot_md5_context *ctx);
@@ -832,6 +864,282 @@ static void mqtt_connect_failure(void *context, MQTTAsync_failureData *response)
             name, code, token, mqtt_connect_code_desc(code), message);
 }
 
+static void mqtt_connection_lost(void *context, char *cause)
+{
+    const char *reason = (cause && cause[0] != '\0') ? cause : "未知原因/服务端未返回cause";
+
+    if (context == &g_gw) {
+        g_gw.connected = 0;
+        fprintf(stderr,
+                "[ERROR] MQTT连接断开: device=gateway, dn=%s, broker=%s, cause=%s\n",
+                g_gw.dn, g_gw.broker, reason);
+        return;
+    }
+
+    if (context) {
+        SubDevice *subdev = (SubDevice *)context;
+        subdev->connected = 0;
+        fprintf(stderr,
+                "[ERROR] MQTT连接断开: device=subdev, dn=%s, pk=%s, cause=%s\n",
+                subdev->dn, subdev->pk, reason);
+        return;
+    }
+
+    fprintf(stderr, "[ERROR] MQTT连接断开: device=unknown, cause=%s\n", reason);
+}
+
+static int mqtt_ignore_message(void *ctx, char *topic, int tlen, MQTTAsync_message *msg)
+{
+    (void)ctx;
+    char *topic_copy = mqtt_topic_dup(topic, tlen);
+    printf("[WARN] MQTT忽略未处理消息: topic=%s\n", topic_copy ? topic_copy : "NULL");
+    free(topic_copy);
+    MQTTAsync_freeMessage(&msg);
+    MQTTAsync_free(topic);
+    return 1;
+}
+
+static int gw_subscribe_checked(const char *label, const char *topic, int qos)
+{
+    if (!g_gw.client) {
+        fprintf(stderr, "[ERROR] gw_init: %s失败, 网关MQTT客户端为空, topic=%s\n",
+                label, topic ? topic : "NULL");
+        return MQTTASYNC_NULL_PARAMETER;
+    }
+
+    if (!topic || topic[0] == '\0') {
+        fprintf(stderr, "[ERROR] gw_init: %s失败, topic为空\n", label);
+        return MQTTASYNC_NULL_PARAMETER;
+    }
+
+    if (!MQTTAsync_isConnected(g_gw.client)) {
+        g_gw.connected = 0;
+        fprintf(stderr,
+                "[ERROR] gw_init: %s失败, 网关MQTT已断开, ret=%d, topic=%s\n",
+                label, MQTTASYNC_DISCONNECTED, topic ? topic : "NULL");
+        return MQTTASYNC_DISCONNECTED;
+    }
+
+    int ret = MQTTAsync_subscribe(g_gw.client, topic, qos, NULL);
+    if (ret != MQTTASYNC_SUCCESS) {
+        fprintf(stderr, "[ERROR] gw_init: %s失败, ret=%d, topic=%s\n", label, ret, topic);
+        if (ret == MQTTASYNC_DISCONNECTED) {
+            g_gw.connected = 0;
+        }
+        return ret;
+    }
+
+    printf("[INFO] gw_init: %s成功, topic=%s\n", label, topic);
+    return MQTTASYNC_SUCCESS;
+}
+
+static void *gw_add_rule_task_thread(void *arg)
+{
+    RouteAddTask *task = (RouteAddTask *)arg;
+    if (!task) {
+        return NULL;
+    }
+
+    printf("[INFO] gw_add_rule_async: 开始异步添加路由规则 (key=%s, val=%s, dn=%s)\n",
+           task->key, task->val, task->sub_dn);
+
+    int ret = gw_add_rule(task->type, task->key, task->val,
+                          task->sub_pk, task->sub_dn, task->sub_ds);
+    if (ret == 0) {
+        printf("[INFO] gw_add_rule_async: 异步添加路由规则成功 (key=%s, val=%s, dn=%s)\n",
+               task->key, task->val, task->sub_dn);
+    } else {
+        fprintf(stderr,
+                "[ERROR] gw_add_rule_async: 异步添加路由规则失败 (key=%s, val=%s, dn=%s, ret=%d)\n",
+                task->key, task->val, task->sub_dn, ret);
+    }
+
+    free(task);
+    return NULL;
+}
+
+static int gw_add_rule_async(RuleType type, const char *key, const char *val,
+                             const char *sub_pk, const char *sub_dn, const char *sub_ds)
+{
+    if (!key || !val || !sub_pk || !sub_dn || !sub_ds) {
+        fprintf(stderr, "[ERROR] gw_add_rule_async: 参数为空\n");
+        return -1;
+    }
+    if (strlen(key) >= sizeof(((RouteAddTask *)0)->key) ||
+        strlen(val) >= sizeof(((RouteAddTask *)0)->val) ||
+        strlen(sub_pk) >= sizeof(((RouteAddTask *)0)->sub_pk) ||
+        strlen(sub_dn) >= sizeof(((RouteAddTask *)0)->sub_dn) ||
+        strlen(sub_ds) >= sizeof(((RouteAddTask *)0)->sub_ds)) {
+        fprintf(stderr,
+                "[ERROR] gw_add_rule_async: 参数长度超限 (key=%s, val=%s, dn=%s)\n",
+                key, val, sub_dn);
+        return -1;
+    }
+
+    RouteAddTask *task = calloc(1, sizeof(*task));
+    if (!task) {
+        fprintf(stderr, "[ERROR] gw_add_rule_async: 分配任务内存失败\n");
+        return -1;
+    }
+
+    task->type = type;
+    memcpy(task->key, key, strlen(key) + 1);
+    memcpy(task->val, val, strlen(val) + 1);
+    memcpy(task->sub_pk, sub_pk, strlen(sub_pk) + 1);
+    memcpy(task->sub_dn, sub_dn, strlen(sub_dn) + 1);
+    memcpy(task->sub_ds, sub_ds, strlen(sub_ds) + 1);
+
+    pthread_t tid;
+    int ret = pthread_create(&tid, NULL, gw_add_rule_task_thread, task);
+    if (ret != 0) {
+        fprintf(stderr, "[ERROR] gw_add_rule_async: 创建动态路由任务线程失败, errno=%d\n", ret);
+        free(task);
+        return -1;
+    }
+
+    ret = pthread_detach(tid);
+    if (ret != 0) {
+        fprintf(stderr, "[WARN] gw_add_rule_async: 分离动态路由任务线程失败, errno=%d\n", ret);
+    }
+
+    printf("[INFO] gw_add_rule_async: 已投递动态路由添加任务 (key=%s, val=%s, dn=%s)\n",
+           key, val, sub_dn);
+    return 0;
+}
+
+static void *gw_del_rule_task_thread(void *arg)
+{
+    RouteDelTask *task = (RouteDelTask *)arg;
+    if (!task) {
+        return NULL;
+    }
+
+    printf("[INFO] gw_del_rule_async: 开始异步删除路由规则 (dn=%s)\n", task->sub_dn);
+
+    int ret = gw_del_rule(task->sub_pk, task->sub_dn, task->sub_ds);
+    if (ret == 0) {
+        printf("[INFO] gw_del_rule_async: 异步删除路由规则成功 (dn=%s)\n", task->sub_dn);
+    } else {
+        fprintf(stderr, "[ERROR] gw_del_rule_async: 异步删除路由规则失败 (dn=%s, ret=%d)\n",
+                task->sub_dn, ret);
+    }
+
+    free(task);
+    return NULL;
+}
+
+static int gw_del_rule_async(const char *sub_pk, const char *sub_dn, const char *sub_ds)
+{
+    if (!sub_pk || !sub_dn || !sub_ds) {
+        fprintf(stderr, "[ERROR] gw_del_rule_async: 参数为空\n");
+        return -1;
+    }
+    if (strlen(sub_pk) >= sizeof(((RouteDelTask *)0)->sub_pk) ||
+        strlen(sub_dn) >= sizeof(((RouteDelTask *)0)->sub_dn) ||
+        strlen(sub_ds) >= sizeof(((RouteDelTask *)0)->sub_ds)) {
+        fprintf(stderr, "[ERROR] gw_del_rule_async: 参数长度超限 (dn=%s)\n", sub_dn);
+        return -1;
+    }
+
+    RouteDelTask *task = calloc(1, sizeof(*task));
+    if (!task) {
+        fprintf(stderr, "[ERROR] gw_del_rule_async: 分配任务内存失败\n");
+        return -1;
+    }
+
+    memcpy(task->sub_pk, sub_pk, strlen(sub_pk) + 1);
+    memcpy(task->sub_dn, sub_dn, strlen(sub_dn) + 1);
+    memcpy(task->sub_ds, sub_ds, strlen(sub_ds) + 1);
+
+    pthread_t tid;
+    int ret = pthread_create(&tid, NULL, gw_del_rule_task_thread, task);
+    if (ret != 0) {
+        fprintf(stderr, "[ERROR] gw_del_rule_async: 创建动态路由删除任务线程失败, errno=%d\n", ret);
+        free(task);
+        return -1;
+    }
+
+    ret = pthread_detach(tid);
+    if (ret != 0) {
+        fprintf(stderr, "[WARN] gw_del_rule_async: 分离动态路由删除任务线程失败, errno=%d\n", ret);
+    }
+
+    printf("[INFO] gw_del_rule_async: 已投递动态路由删除任务 (dn=%s)\n", sub_dn);
+    return 0;
+}
+
+static void *user_service_task_thread(void *arg)
+{
+    UserServiceTask *task = (UserServiceTask *)arg;
+    if (!task) {
+        return NULL;
+    }
+
+    int ret = task->cb(task->topic ? task->topic : "",
+                       task->method,
+                       task->params_json ? task->params_json : "{}");
+    printf("[INFO] user_service_dispatch_async: 用户服务处理完成 (method=%s, ret=%d)\n",
+           task->method, ret);
+
+    free(task->topic);
+    free(task->params_json);
+    free(task);
+    return NULL;
+}
+
+static int user_service_dispatch_async(const char *topic, const char *method, const char *params_json)
+{
+    user_service_cb_t cb = g_user_service_cb;
+    const char *params = params_json ? params_json : "{}";
+
+    if (!cb) {
+        return 1;
+    }
+    if (!method || strlen(method) == 0 || strlen(method) >= sizeof(((UserServiceTask *)0)->method)) {
+        fprintf(stderr, "[ERROR] user_service_dispatch_async: method非法\n");
+        return -1;
+    }
+
+    UserServiceTask *task = calloc(1, sizeof(*task));
+    if (!task) {
+        fprintf(stderr, "[ERROR] user_service_dispatch_async: 分配任务内存失败\n");
+        return -1;
+    }
+
+    task->cb = cb;
+    memcpy(task->method, method, strlen(method) + 1);
+
+    task->topic = malloc(strlen(topic ? topic : "") + 1);
+    task->params_json = malloc(strlen(params) + 1);
+    if (!task->topic || !task->params_json) {
+        fprintf(stderr, "[ERROR] user_service_dispatch_async: 分配字符串内存失败\n");
+        free(task->topic);
+        free(task->params_json);
+        free(task);
+        return -1;
+    }
+    memcpy(task->topic, topic ? topic : "", strlen(topic ? topic : "") + 1);
+    memcpy(task->params_json, params, strlen(params) + 1);
+
+    pthread_t tid;
+    int ret = pthread_create(&tid, NULL, user_service_task_thread, task);
+    if (ret != 0) {
+        fprintf(stderr, "[ERROR] user_service_dispatch_async: 创建用户服务任务线程失败, errno=%d\n", ret);
+        free(task->topic);
+        free(task->params_json);
+        free(task);
+        return -1;
+    }
+
+    ret = pthread_detach(tid);
+    if (ret != 0) {
+        fprintf(stderr, "[WARN] user_service_dispatch_async: 分离用户服务任务线程失败, errno=%d\n", ret);
+    }
+
+    printf("[INFO] user_service_dispatch_async: 已投递用户服务任务 (method=%s)\n", method);
+    return 0;
+}
+
 
 int subdev_init(SubDevice *subdev) {
     // 1. 入参校验 + 详细错误打印
@@ -874,6 +1182,16 @@ int subdev_init(SubDevice *subdev) {
         return -1;
     }
     printf("[INFO] subdev_init: 创建MQTT客户端成功 (dn=%s)\n", subdev->dn);
+
+    ret = MQTTAsync_setCallbacks(subdev->client, subdev, mqtt_connection_lost, mqtt_ignore_message, NULL);
+    if (ret != MQTTASYNC_SUCCESS) {
+        fprintf(stderr, "[ERROR] subdev_init: 设置MQTT断连回调失败 (dn=%s, ret=%d)\n",
+                subdev->dn, ret);
+        MQTTAsync_destroy(&subdev->client);
+        subdev->client = NULL;
+        return -1;
+    }
+    printf("[INFO] subdev_init: 设置MQTT断连回调成功 (dn=%s)\n", subdev->dn);
 
     // 6. 配置MQTT连接参数 + 增加超时/清理会话等关键参数
     MQTTAsync_connectOptions opt = MQTTAsync_connectOptions_initializer;
@@ -1968,7 +2286,8 @@ static int gw_on_message(void *ctx, char *topic, int tlen, MQTTAsync_message *ms
         return 1;
     }
 
-    if (strcmp(topic_copy, property_set_topic) != 0) {
+    if (strcmp(topic_copy, property_set_topic) != 0 &&
+        !strstr(topic_copy, "/thing/service/")) {
         printf("[WARN] gw_on_message: 忽略非SDK订阅业务主题, topic=%s\n", topic_copy);
         GW_FREE_MESSAGE();
         return 1;
@@ -2003,25 +2322,17 @@ static int gw_on_message(void *ctx, char *topic, int tlen, MQTTAsync_message *ms
         params_json = cJSON_PrintUnformatted(params_obj);
     }
 
-    // 优先执行 用户自定义处理逻辑
-    if (g_user_service_cb != NULL)
-    {
-        int user_ret = g_user_service_cb(topic_copy, method, params_json ? params_json : "{}");
-        if (user_ret == 0)
-        {
-            // 自定义拦截，直接释放资源退出
-            if(params_json) free(params_json);
-            cJSON_Delete(root);
-            GW_FREE_MESSAGE();
-            return 1;
-        }
-    }
-    // ========================================================================
-
-    // 4. 校验 method 是否为路由相关指令
+    // 4. 校验 method 是否为路由相关指令；非内置服务异步交给用户处理。
     if (strcmp(method, "thing.service.add_rule") != 0 && 
         strcmp(method, "thing.service.del_rule") != 0) {
-        printf("[WARN] gw_on_message: 忽略非路由指令, method=%s\n", method);
+        ret = user_service_dispatch_async(topic_copy, method, params_json ? params_json : "{}");
+        if (ret == 0) {
+            printf("[INFO] gw_on_message: 用户服务任务已投递, method=%s\n", method);
+        } else if (ret > 0) {
+            printf("[WARN] gw_on_message: 未注册用户服务回调，忽略非路由指令, method=%s\n", method);
+        } else {
+            fprintf(stderr, "[ERROR] gw_on_message: 用户服务任务投递失败, method=%s\n", method);
+        }
         cJSON_Delete(root);
         if(params_json) free(params_json);
         GW_FREE_MESSAGE();
@@ -2113,22 +2424,22 @@ static int gw_on_message(void *ctx, char *topic, int tlen, MQTTAsync_message *ms
         }
         // 提取子设备信息
 
-        // 转换规则类型并添加路由
+        // 转换规则类型并投递异步添加任务。不要在 MQTT 回调线程里等待子设备连接完成。
         RuleType t = (strcmp(type, "num") == 0) ? RULE_NUM : RULE_STR;
-        ret = gw_add_rule(t, key, val, sub_pk, sub_dn, sub_ds);
+        ret = gw_add_rule_async(t, key, val, sub_pk, sub_dn, sub_ds);
         if (ret == 0) {
-            printf("[INFO] gw_on_message: 添加路由规则成功, cmd=%s, key=%s, val=%s\n", cmd, key, val);
+            printf("[INFO] gw_on_message: 添加路由规则任务已投递, cmd=%s, key=%s, val=%s\n", cmd, key, val);
         } else {
-            fprintf(stderr, "[ERROR] gw_on_message: 添加路由规则失败, cmd=%s, key=%s, val=%s\n", cmd, key, val);
+            fprintf(stderr, "[ERROR] gw_on_message: 添加路由规则任务投递失败, cmd=%s, key=%s, val=%s\n", cmd, key, val);
         }
     }
     // 处理删除路由（仅需要 key/val）
     else if (strcmp(cmd, "del_rule") == 0) {
-        ret = gw_del_rule(sub_pk, sub_dn, sub_ds);
+        ret = gw_del_rule_async(sub_pk, sub_dn, sub_ds);
         if (ret == 0) {
-            printf("[INFO] gw_on_message: 删除路由规则成功, name=%s\n", sub_dn);
+            printf("[INFO] gw_on_message: 删除路由规则任务已投递, name=%s\n", sub_dn);
         } else {
-            fprintf(stderr, "[ERROR] gw_on_message: 删除路由规则失败, cmd=%s, key=%s, val=%s\n", cmd, key, val);
+            fprintf(stderr, "[ERROR] gw_on_message: 删除路由规则任务投递失败, cmd=%s, key=%s, val=%s\n", cmd, key, val);
         }
     }
     // 未知指令
@@ -2351,7 +2662,7 @@ int gw_init(const char *cfg_path) {
     printf("[INFO] gw_init: 创建网关MQTT客户端成功\n");
 
     // 8. 设置MQTT回调函数 + 错误打印
-    ret = MQTTAsync_setCallbacks(g_gw.client, NULL, NULL, gw_on_message, NULL);
+    ret = MQTTAsync_setCallbacks(g_gw.client, &g_gw, mqtt_connection_lost, gw_on_message, NULL);
     if (ret != MQTTASYNC_SUCCESS) {
         fprintf(stderr, "[ERROR] gw_init: 设置MQTT回调函数失败, ret=%d\n", ret);
         MQTTAsync_destroy(&g_gw.client);
@@ -2396,36 +2707,25 @@ int gw_init(const char *cfg_path) {
     // 10. 订阅网关下行主题 + 错误打印
     char sub_topic[256];
     snprintf(sub_topic, 256, "/sys/%s/%s/thing/service/property/set", g_gw.pk, g_gw.dn);
-    ret = MQTTAsync_subscribe(g_gw.client, sub_topic, 1, NULL);
-    if (ret != MQTTASYNC_SUCCESS) {
-        fprintf(stderr, "[ERROR] gw_init: 订阅下行主题失败, ret=%d, topic=%s\n", ret, sub_topic);
-        // 不直接返回，订阅失败不影响核心功能
-    } else {
-        printf("[INFO] gw_init: 订阅下行主题成功, topic=%s\n", sub_topic);
-    }
+    gw_subscribe_checked("订阅下行主题", sub_topic, 1);
+
+    char service_topic[256];
+    snprintf(service_topic, sizeof(service_topic), "/sys/%s/%s/thing/service/add_rule", g_gw.pk, g_gw.dn);
+    gw_subscribe_checked("订阅服务调用主题", service_topic, 1);
+    char service_topic_2[256];
+    snprintf(service_topic_2, sizeof(service_topic), "/sys/%s/%s/thing/service/del_rule", g_gw.pk, g_gw.dn);
+    gw_subscribe_checked("订阅服务调用主题", service_topic_2, 1);
+
     char ota_sub_topic[256];
     snprintf(ota_sub_topic, sizeof(ota_sub_topic), 
          "/ota/device/upgrade/%s/%s", 
          g_gw.pk, g_gw.dn);
-
-    ret = MQTTAsync_subscribe(g_gw.client, ota_sub_topic, 1, NULL);
-    if (ret != MQTTASYNC_SUCCESS) {
-        fprintf(stderr, "[ERROR] gw_init: 订阅OTA升级主题失败, ret=%d, topic=%s\n", ret, ota_sub_topic);
-    } else {
-        printf("[INFO] gw_init: 订阅OTA升级主题成功, topic=%s\n", ota_sub_topic);
-    }
+    gw_subscribe_checked("订阅OTA升级主题", ota_sub_topic, 1);
 
     char file_download_reply_topic[256];
     snprintf(file_download_reply_topic, sizeof(file_download_reply_topic),
              "/sys/%s/%s/thing/file/download_reply", g_gw.pk, g_gw.dn);
-    ret = MQTTAsync_subscribe(g_gw.client, file_download_reply_topic, 1, NULL);
-    if (ret != MQTTASYNC_SUCCESS) {
-        fprintf(stderr, "[ERROR] gw_init: 订阅MQTT文件下载响应主题失败, ret=%d, topic=%s\n",
-                ret, file_download_reply_topic);
-    } else {
-        printf("[INFO] gw_init: 订阅MQTT文件下载响应主题成功, topic=%s\n",
-               file_download_reply_topic);
-    }
+    gw_subscribe_checked("订阅MQTT文件下载响应主题", file_download_reply_topic, 1);
 
     // 11. 初始化子设备 + 错误打印
     pthread_rwlock_wrlock(&g_route.lock);
@@ -2824,6 +3124,8 @@ int gw_publish_subdev_by_name(const char *dn, const char *payload)
 
 int gw_add_rule(RuleType type, const char *key, const char *val,
                 const char *sub_pk, const char *sub_dn, const char *sub_ds) {
+    RouteRule candidate;
+
     // 1. 入参全量合法性校验 + 错误日志
     if (key == NULL || strlen(key) == 0) {
         fprintf(stderr, "[ERROR] gw_add_rule: 匹配字段key为空\n");
@@ -2843,7 +3145,7 @@ int gw_add_rule(RuleType type, const char *key, const char *val,
     printf("[INFO] gw_add_rule: 开始添加路由规则 (key=%s, val=%s, dn=%s)\n",
            key, val, sub_dn);
 
-    // 2. 获取路由表写锁 + 错误日志
+    // 2. 快速检查当前路由表状态。子设备 MQTT 初始化会耗时，不能持锁执行。
     int ret = pthread_rwlock_wrlock(&g_route.lock);
     if (ret != 0) {
         fprintf(stderr, "[ERROR] gw_add_rule: 获取路由表写锁失败, errno=%d\n", ret);
@@ -2854,34 +3156,34 @@ int gw_add_rule(RuleType type, const char *key, const char *val,
     if (g_route.count >= MAX_ROUTE_RULES) {
         fprintf(stderr, "[ERROR] gw_add_rule: 路由规则数量超限 (当前=%d, 最大=%d)\n",
                 g_route.count, MAX_ROUTE_RULES);
-        pthread_rwlock_unlock(&g_route.lock); // 释放锁
+        pthread_rwlock_unlock(&g_route.lock);
         return -1;
     }
 
-    // 4. 检查子设备是否已存在（避免重复添加）
-    int exists = 0;
     for (int i = 0; i < g_route.count; i++) {
         RouteRule *r = &g_route.rules[i];
         if (strcmp(r->subdev.dn, sub_dn) == 0) {
-            exists = 1;
-            break;
+            fprintf(stderr, "[ERROR] gw_add_rule: 子设备已存在，无需重复添加 (dn=%s)\n", sub_dn);
+            pthread_rwlock_unlock(&g_route.lock);
+            return -1;
         }
     }
-    if (exists) {
-        fprintf(stderr, "[ERROR] gw_add_rule: 子设备已存在，无需重复添加 (dn=%s)\n", sub_dn);
-        pthread_rwlock_unlock(&g_route.lock); // 释放锁
+
+    ret = pthread_rwlock_unlock(&g_route.lock);
+    if (ret != 0) {
+        fprintf(stderr, "[ERROR] gw_add_rule: 释放路由表写锁失败, errno=%d\n", ret);
         return -1;
     }
 
-    // 5. 拷贝路由规则参数 + 安全校验
-    RouteRule *r = &g_route.rules[g_route.count];
+    // 3. 在局部候选规则中准备参数，连接成功前不暴露给上报线程。
+    memset(&candidate, 0, sizeof(candidate));
+    RouteRule *r = &candidate;
     r->type = type;
 
     // 安全拷贝key（防止缓冲区溢出）
     if (strlen(key) >= sizeof(r->key)) {
         fprintf(stderr, "[ERROR] gw_add_rule: key长度超限 (key=%s, 长度=%lu, 最大=%lu)\n",
                 key, strlen(key), sizeof(r->key)-1);
-        pthread_rwlock_unlock(&g_route.lock);
         return -1;
     }
     strncpy(r->key, key, sizeof(r->key)-1);
@@ -2895,7 +3197,6 @@ int gw_add_rule(RuleType type, const char *key, const char *val,
         if (strlen(val) >= sizeof(r->val.str)) {
             fprintf(stderr, "[ERROR] gw_add_rule: val长度超限 (val=%s, 长度=%lu, 最大=%lu)\n",
                     val, strlen(val), sizeof(r->val.str)-1);
-            pthread_rwlock_unlock(&g_route.lock);
             return -1;
         }
         strncpy(r->val.str, val, sizeof(r->val.str)-1);
@@ -2909,7 +3210,6 @@ int gw_add_rule(RuleType type, const char *key, const char *val,
         strlen(sub_ds) >= sizeof(r->subdev.ds)) {
         fprintf(stderr, "[ERROR] gw_add_rule: 子设备三元组长度超限 (pk长度=%lu, dn长度=%lu, ds长度=%lu)\n",
                 strlen(sub_pk), strlen(sub_dn), strlen(sub_ds));
-        pthread_rwlock_unlock(&g_route.lock);
         return -1;
     }
     strncpy(r->subdev.pk, sub_pk, sizeof(r->subdev.pk)-1);
@@ -2919,44 +3219,61 @@ int gw_add_rule(RuleType type, const char *key, const char *val,
     r->subdev.dn[sizeof(r->subdev.dn)-1] = '\0';
     r->subdev.ds[sizeof(r->subdev.ds)-1] = '\0';
 
-    // 6. 增加路由规则计数
-    g_route.count++;
-    printf("[INFO] gw_add_rule: 路由规则参数拷贝完成 (当前规则数=%d, dn=%s)\n",
-           g_route.count, sub_dn);
+    printf("[INFO] gw_add_rule: 路由规则参数拷贝完成，准备初始化子设备 (dn=%s)\n",
+           sub_dn);
 
-    // 7. 释放写锁
+    // 4. 初始化子设备MQTT客户端。此阶段不持有路由表锁，避免阻塞上报线程。
+    ret = subdev_init(&candidate.subdev);
+    if (ret != 0) {
+        fprintf(stderr, "[ERROR] gw_add_rule: 子设备初始化失败 (dn=%s, ret=%d)\n", sub_dn, ret);
+        return -1;
+    }
+
+    // 5. 连接成功后再写入路由表，写锁只覆盖最终插入动作。
+    ret = pthread_rwlock_wrlock(&g_route.lock);
+    if (ret != 0) {
+        fprintf(stderr, "[ERROR] gw_add_rule: 获取路由表写锁失败, errno=%d\n", ret);
+        subdev_destroy(&candidate.subdev);
+        return -1;
+    }
+
+    if (g_route.count >= MAX_ROUTE_RULES) {
+        fprintf(stderr, "[ERROR] gw_add_rule: 路由规则数量超限 (当前=%d, 最大=%d)\n",
+                g_route.count, MAX_ROUTE_RULES);
+        pthread_rwlock_unlock(&g_route.lock);
+        subdev_destroy(&candidate.subdev);
+        return -1;
+    }
+
+    for (int i = 0; i < g_route.count; i++) {
+        if (strcmp(g_route.rules[i].subdev.dn, sub_dn) == 0) {
+            fprintf(stderr, "[ERROR] gw_add_rule: 子设备已存在，放弃本次添加 (dn=%s)\n", sub_dn);
+            pthread_rwlock_unlock(&g_route.lock);
+            subdev_destroy(&candidate.subdev);
+            return -1;
+        }
+    }
+
+    g_route.rules[g_route.count] = candidate;
+    g_route.count++;
+    int new_count = g_route.count;
+
     ret = pthread_rwlock_unlock(&g_route.lock);
     if (ret != 0) {
         fprintf(stderr, "[ERROR] gw_add_rule: 释放路由表写锁失败, errno=%d\n", ret);
-        // 锁释放失败仍尝试初始化子设备，避免规则添加但设备未创建
-    }
-
-    // 8. 初始化子设备MQTT客户端
-    ret = subdev_init(&r->subdev);
-    if (ret != 0) {
-        fprintf(stderr, "[ERROR] gw_add_rule: 子设备初始化失败 (dn=%s, ret=%d)\n", sub_dn, ret);
-        if (pthread_rwlock_wrlock(&g_route.lock) == 0) {
-            for (int i = 0; i < g_route.count; i++) {
-                if (strcmp(g_route.rules[i].subdev.dn, sub_dn) == 0) {
-                    for (int j = i; j < g_route.count - 1; j++) {
-                        g_route.rules[j] = g_route.rules[j + 1];
-                    }
-                    g_route.count--;
-                    break;
-                }
-            }
-            pthread_rwlock_unlock(&g_route.lock);
-        }
         return -1;
     }
 
     printf("[INFO] gw_add_rule: 路由规则添加成功 (dn=%s, 规则总数=%d)\n",
-           sub_dn, g_route.count);
+           sub_dn, new_count);
     return 0;
 }
 
 // 动态删除路由 → 自动销毁客户端
 int gw_del_rule(const char *sub_pk, const char *sub_dn, const char *sub_ds) {
+    RouteRule removed_rule;
+    int found = 0;
+
     // 1. 入参校验 + 错误日志
     if (sub_pk == NULL || sub_dn == NULL || sub_ds == NULL) {
         fprintf(stderr, "[ERROR] gw_del_rule: 子设备三元组参数为空 (pk=%s, dn=%s, ds=%s)\n",
@@ -2969,7 +3286,14 @@ int gw_del_rule(const char *sub_pk, const char *sub_dn, const char *sub_ds) {
         return -1;
     }
 
-    pthread_rwlock_wrlock(&g_route.lock);
+    memset(&removed_rule, 0, sizeof(removed_rule));
+
+    int lock_ret = pthread_rwlock_wrlock(&g_route.lock);
+    if (lock_ret != 0) {
+        fprintf(stderr, "[ERROR] gw_del_rule: 获取路由表写锁失败, errno=%d\n", lock_ret);
+        return -1;
+    }
+
     int idx = -1;
     // 2. 遍历路由表，匹配子设备三元组
     for (int i = 0; i < g_route.count; i++) {
@@ -2979,9 +3303,9 @@ int gw_del_rule(const char *sub_pk, const char *sub_dn, const char *sub_ds) {
             strcmp(r->subdev.dn, sub_dn) == 0 &&
             strcmp(r->subdev.ds, sub_ds) == 0) {
             idx = i;
-            printf("[INFO] gw_del_rule: 找到匹配的路由规则 (dn=%s), 开始销毁子设备...\n", sub_dn);
-            // 销毁子设备MQTT客户端
-            subdev_destroy(&r->subdev);
+            removed_rule = *r;
+            found = 1;
+            printf("[INFO] gw_del_rule: 找到匹配的路由规则 (dn=%s), 先从路由表移除\n", sub_dn);
             break;
         }
     }
@@ -2996,6 +3320,12 @@ int gw_del_rule(const char *sub_pk, const char *sub_dn, const char *sub_ds) {
     }
     g_route.count--;
     pthread_rwlock_unlock(&g_route.lock);
+
+    if (found) {
+        printf("[INFO] gw_del_rule: 路由表移除完成，开始销毁子设备 (dn=%s)\n", sub_dn);
+        subdev_destroy(&removed_rule.subdev);
+    }
+
     printf("[INFO] gw_del_rule: 路由规则删除成功 (pk=%s, dn=%s, ds=%s)\n",
            sub_pk, sub_dn, sub_ds);
     return 0;

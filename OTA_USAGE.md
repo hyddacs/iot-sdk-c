@@ -1,6 +1,6 @@
 # OTA升级使用说明
 
-本文说明本SDK在网关设备上处理阿里云物联网平台OTA升级任务的流程。SDK负责订阅OTA任务、下载升级包、校验下载内容、上报进度和版本；升级包数据如何保存、烧录、解包和切换分区由用户回调函数完成。
+本文说明本SDK在网关设备上处理阿里云物联网平台下行任务及OTA升级任务的流程。SDK负责订阅OTA任务、下载升级包、校验下载内容、上报进度和版本；升级包数据如何保存、烧录、解包和切换分区由用户回调函数完成。
 
 ## 1. 启动顺序
 
@@ -8,6 +8,7 @@
 
 ```c
 register_ota_callbacks();
+register_user_service_callback();
 
 if (gw_init("gw_route.cfg") != 0) {
     return -1;
@@ -29,8 +30,24 @@ gw_destroy();
 注意事项：
 
 - OTA回调必须在`gw_init()`之前注册。`gw_init()`会订阅OTA下行Topic，如果先初始化再注册回调，极端情况下可能收到OTA任务但数据回调尚未设置。
+- 用户服务回调也建议在`gw_init()`之前注册。`gw_init()`订阅属性设置服务Topic后，云端服务调用会进入该回调。
 - 启动后应先上报当前版本，例如`1.0.0`。SDK内部会避免在首次版本上报成功前启动OTA处理线程；如果平台提前下发OTA任务，SDK会先缓存任务，版本上报成功后再处理。
 - 主线程不能在版本上报后立即退出。OTA任务在线程中执行，程序退出前应调用`gw_ota_is_busy()`和`gw_ota_wait_complete(-1)`等待任务完成。
+
+## 1.1 下行指令异步处理模型
+
+SDK收到阿里云平台下行消息后，`gw_on_message()`只负责快速解析、分类和投递任务，不在MQTT消息回调线程中执行耗时业务。
+
+当前异步处理范围：
+
+| 下行类型 | 处理方式 |
+| --- | --- |
+| `thing.service.add_rule` | 投递到动态路由添加线程，后台执行`gw_add_rule()` |
+| `thing.service.del_rule` | 投递到动态路由删除线程，后台执行`gw_del_rule()` |
+| 自定义服务调用 | 投递到用户服务线程，后台执行`user_service_cb_t`回调 |
+| OTA升级通知 | 投递到OTA任务线程，后台下载、校验和调用OTA用户回调 |
+
+因此，云端下发指令不会再因为初始化/销毁子设备MQTT客户端、用户自定义业务处理、OTA下载等耗时操作阻塞MQTT消息回调线程。动态路由内部也避免在持有路由表锁时执行子设备MQTT连接或销毁，降低对上报线程的影响。
 
 ## 2. 必须注册的用户回调
 
@@ -53,6 +70,50 @@ gw_register_ota_data_callback(app_ota_data_handler);
 | `ota_file_finish_cb` | 单个文件下载且SDK校验通过后 | 关闭存储、确认烧录结果、设置启动标志 |
 
 `ota_data_cb`返回`0`表示继续下载，返回非0表示用户处理失败，SDK会中止OTA并上报异常。
+
+## 2.1 用户服务回调示例
+
+SDK通过`iot_set_user_service_callback()`注册云端服务调用回调。回调原型如下：
+
+```c
+typedef int (*user_service_cb_t)(const char *topic,
+                                 const char *method,
+                                 const char *params_json);
+```
+
+推荐在`gw_init()`之前注册：
+
+```c
+static int app_user_service_handler(const char *topic,
+                                    const char *method,
+                                    const char *params_json)
+{
+    printf("[APP SERVICE] topic=%s, method=%s, params=%s\n",
+           topic ? topic : "",
+           method ? method : "",
+           params_json ? params_json : "{}");
+
+    if (method && strcmp(method, "？？？") == 0) {
+        printf("[APP SERVICE] handle echo: %s\n", params_json ? params_json : "{}");
+        return 0;
+    }
+
+    return 0;
+}
+
+static void register_user_service_callback(void)
+{
+    iot_set_user_service_callback(app_user_service_handler);
+}
+```
+
+返回值语义：
+
+- 回调在线程中异步执行，返回值只用于SDK日志记录。
+- 返回值不再决定是否拦截SDK内置逻辑。
+- `thing.service.add_rule`和`thing.service.del_rule`由SDK内置动态路由逻辑优先处理，不经过用户服务回调拦截。
+
+云端下发自定义服务时，`params_json`是`params`对象的紧凑JSON字符串。业务代码可以在回调中解析参数、控制本地硬件、转发到业务线程或记录日志。该回调已经不在MQTT消息回调线程中执行，耗时业务不会阻塞SDK接收后续下行消息。
 
 ## 3. 支持的OTA下发格式
 
@@ -311,52 +372,3 @@ fwrite(data, 1, len, g_ota_file);
 - 写外部Flash
 - 写临时文件后解包
 - 写多个固件文件到不同地址
-
-## 8. 常见问题
-
-### 8.1 程序启动后立即退出
-
-主线程必须持续运行，否则收不到OTA下行消息。示例中使用：
-
-```c
-while (running) {
-    sleep(1);
-}
-```
-
-退出前应等待OTA完成：
-
-```c
-if (gw_ota_is_busy()) {
-    gw_ota_wait_complete(-1);
-}
-```
-
-### 8.2 重复收到OTA升级消息
-
-阿里云可能重复下发OTA任务。SDK已有保护：如果当前OTA任务正在执行，后续重复通知会被确认并忽略，不会重复启动下载线程。
-
-### 8.3 MQTT回调Topic变成异常字符串
-
-Paho的`messageArrived`回调返回值必须遵守约定：释放`message/topic`后必须返回`1`。返回`0`会触发Paho重新投递同一消息，若此时已经释放内存，会出现Topic或Payload异常。SDK已统一修复为释放后返回`1`。
-
-### 8.4 HTTP OTA下载走了本地代理
-
-如果环境变量配置了代理，libcurl可能尝试访问`127.0.0.1:7890`等代理地址。SDK已设置：
-
-```c
-curl_easy_setopt(curl, CURLOPT_PROXY, "");
-```
-
-避免OTA下载被环境代理劫持。
-
-### 8.5 HTTPS证书问题
-
-SDK默认启用TLS证书校验：
-
-```c
-CURLOPT_SSL_VERIFYPEER = 1
-CURLOPT_SSL_VERIFYHOST = 2
-```
-
-如果设备没有CA证书环境，HTTPS下载可能失败。正式设备应安装CA证书，不建议关闭校验。

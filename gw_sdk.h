@@ -63,7 +63,8 @@ typedef struct {
     int connected;
 } Gateway;
 
-// 新增：服务调用 自定义回调函数类型
+// 服务调用自定义回调函数类型。
+// 回调在线程中异步执行，返回值仅用于日志记录，不再阻塞或拦截SDK内置服务处理。
 typedef int (*user_service_cb_t)(const char *topic, const char *method, const char *params_json);
 
 // OTA 升级通知回调。SDK 只解析升级元信息，下载后的数据处理由用户回调完成。
@@ -247,7 +248,7 @@ int json_get_str(const char *json, const char *key, char *out, int len);
  */
 int json_get_int(const char *json, const char *key, int *out);
 
-// 全局注册自定义服务回调，外部用户可调用
+// 全局注册自定义服务回调，外部用户可调用。SDK内置动态路由指令不经过该回调拦截。
 void iot_set_user_service_callback(user_service_cb_t cb);
 
 // 注册 OTA 回调
